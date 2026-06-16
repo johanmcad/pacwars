@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<!--
+  LIGHT-CYCLES — a 1-vs-1 Tron duel for two players on one keyboard.
+
+  Leave a wall of light behind you. Box your opponent in, or make them
+  crash. Don't hit a wall, a trail, or your own tail. First to 5 wins.
+
+  Player 1 (blue):  W A S D
+  Player 2 (gold):  Arrow keys
+  Enter: start / next round   ·   R: reset match
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LIGHT-CYCLES</title>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #050510;
+    color: #f0f0f0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: Consolas, "Courier New", monospace;
+  }
+  canvas {
+    image-rendering: pixelated;
+    box-shadow: 0 0 40px rgba(64, 140, 255, 0.25);
+    max-width: 100vw;
+    max-height: 100vh;
+    border-radius: 6px;
+  }
+  a.back {
+    position: fixed;
+    top: 14px; left: 16px;
+    color: #8890a8;
+    text-decoration: none;
+    font-size: 0.8rem;
+    letter-spacing: 0.15em;
+  }
+  a.back:hover { color: #408cff; }
+</style>
+</head>
+<body>
+<a class="back" href="../index.html">◂ ARCADE</a>
+<canvas id="game"></canvas>
+<script>
+"use strict";
+
+// ---------------------------------------------------------------- constants
+const CELL = 16;
+const COLS = 51, ROWS = 39;            // odd so each player starts centred in a lane
+const HUD_H = 64;
+const WIDTH = COLS * CELL;
+const HEIGHT = ROWS * CELL + HUD_H;
+const TICK = 1000 / 18;                // movement step (ms) — snappy but readable
+const WIN_SCORE = 5;
+
+const UP = [0, -1], DOWN = [0, 1], LEFT = [-1, 0], RIGHT = [1, 0];
+
+const P1_COLOR = "#3da0ff", P1_GLOW = "rgba(61,160,255,0.9)";
+const P2_COLOR = "#ffe81f", P2_GLOW = "rgba(255,232,31,0.9)";
+const GRID_COLOR = "rgba(64,140,255,0.07)";
+
+// ---------------------------------------------------------------- canvas
+const canvas = document.getElementById("game");
+canvas.width = WIDTH;
+canvas.height = HEIGHT;
+const ctx = canvas.getContext("2d");
+
+// ---------------------------------------------------------------- sound
+let audio = null;
+function beep(freq, dur, type) {
+  try {
+    if (!audio) audio = new (window.AudioContext || window.webkitAudioContext)();
+    const o = audio.createOscillator(), g = audio.createGain();
+    o.type = type || "square";
+    o.frequency.value = freq;
+    o.connect(g); g.connect(audio.destination);
+    g.gain.setValueAtTime(0.07, audio.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001, audio.currentTime + dur);
+    o.start();
+    o.stop(audio.currentTime + dur);
+  } catch (e) { /* audio optional */ }
+}
+
+// ---------------------------------------------------------------- state
+const STATE = { TITLE: 0, PLAY: 1, ROUND_OVER: 2, MATCH_OVER: 3 };
+let state = STATE.TITLE;
+
+let occupied;          // Set of "x,y" cells with a trail/wall
+let players;
+let scores = [0, 0];
+let lastTick = 0;
+let roundMsg = "";
+
+function makePlayer(x, y, dir, color, glow, name) {
+  return { x, y, dir, next: dir, color, glow, name, alive: true, trail: [] };
+}
+
+function resetRound() {
+  occupied = new Set();
+  const midY = (ROWS - 1) / 2 | 0;
+  players = [
+    makePlayer(6,        midY, RIGHT, P1_COLOR, P1_GLOW, "BLUE"),
+    makePlayer(COLS - 7, midY, LEFT,  P2_COLOR, P2_GLOW, "GOLD"),
+  ];
+  for (const p of players) {
+    p.trail.push([p.x, p.y]);
+    occupied.add(p.x + "," + p.y);
+  }
+  state = STATE.PLAY;
+  lastTick = 0;
+}
+
+function resetMatch() {
+  scores = [0, 0];
+  resetRound();
+}
+
+// ---------------------------------------------------------------- input
+// queue the next direction; forbid instant 180° reversals (would self-crash)
+const KEYS = {
+  // player 1 — WASD
+  "w": [0, UP], "a": [0, LEFT], "s": [0, DOWN], "d": [0, RIGHT],
+  // player 2 — arrows
+  "arrowup": [1, UP], "arrowleft": [1, LEFT], "arrowdown": [1, DOWN], "arrowright": [1, RIGHT],
+};
+
+window.addEventListener("keydown", (e) => {
+  const key = e.key.toLowerCase();
+  if (["arrowup", "arrowdown", "arrowleft", "arrowright", " "].includes(key)) e.preventDefault();
+
+  if (key === "enter") {
+    if (state === STATE.TITLE || state === STATE.MATCH_OVER) resetMatch();
+    else if (state === STATE.ROUND_OVER) resetRound();
+    return;
+  }
+  if (key === "r") { state = STATE.TITLE; return; }
+
+  const map = KEYS[key];
+  if (map && state === STATE.PLAY) {
+    const [idx, dir] = map;
+    const p = players[idx];
+    if (dir[0] !== -p.dir[0] || dir[1] !== -p.dir[1]) p.next = dir;
+  }
+});
+
+// ---------------------------------------------------------------- update
+function step() {
+  for (const p of players) {
+    if (!p.alive) continue;
+    p.dir = p.next;
+    p.x += p.dir[0];
+    p.y += p.dir[1];
+  }
+
+  // resolve crashes after BOTH have moved (so head-on collisions are mutual)
+  const heads = {};
+  for (const p of players) {
+    if (!p.alive) continue;
+    const out = p.x < 0 || p.x >= COLS || p.y < 0 || p.y >= ROWS;
+    if (out || occupied.has(p.x + "," + p.y)) p.alive = false;
+    const k = p.x + "," + p.y;
+    heads[k] = (heads[k] || 0) + 1;
+  }
+  for (const p of players) {        // head-on into same cell = both die
+    if (p.alive && heads[p.x + "," + p.y] > 1) p.alive = false;
+  }
+
+  for (const p of players) {
+    if (p.alive) {
+      occupied.add(p.x + "," + p.y);
+      p.trail.push([p.x, p.y]);
+    }
+  }
+
+  const dead = players.filter(p => !p.alive).length;
+  if (dead > 0) endRound();
+}
+
+function endRound() {
+  const p1 = players[0].alive, p2 = players[1].alive;
+  if (p1 && !p2)      { scores[0]++; roundMsg = "BLUE SCORES"; beep(660, 0.18, "square"); }
+  else if (p2 && !p1) { scores[1]++; roundMsg = "GOLD SCORES"; beep(660, 0.18, "square"); }
+  else                { roundMsg = "DOUBLE CRASH — NO POINT"; beep(120, 0.4, "sawtooth"); }
+
+  if (scores[0] >= WIN_SCORE || scores[1] >= WIN_SCORE) state = STATE.MATCH_OVER;
+  else state = STATE.ROUND_OVER;
+}
+
+// ---------------------------------------------------------------- render
+function drawGrid() {
+  ctx.fillStyle = "#08081c";
+  ctx.fillRect(0, HUD_H, WIDTH, HEIGHT - HUD_H);
+  ctx.strokeStyle = GRID_COLOR;
+  ctx.lineWidth = 1;
+  for (let x = 0; x <= COLS; x++) {
+    ctx.beginPath();
+    ctx.moveTo(x * CELL + 0.5, HUD_H);
+    ctx.lineTo(x * CELL + 0.5, HEIGHT);
+    ctx.stroke();
+  }
+  for (let y = 0; y <= ROWS; y++) {
+    ctx.beginPath();
+    ctx.moveTo(0, HUD_H + y * CELL + 0.5);
+    ctx.lineTo(WIDTH, HUD_H + y * CELL + 0.5);
+    ctx.stroke();
+  }
+}
+
+function drawTrail(p) {
+  ctx.fillStyle = p.color;
+  for (const [x, y] of p.trail) {
+    ctx.fillRect(x * CELL + 1, HUD_H + y * CELL + 1, CELL - 2, CELL - 2);
+  }
+  // glowing head
+  const [hx, hy] = p.trail[p.trail.length - 1];
+  ctx.shadowColor = p.glow;
+  ctx.shadowBlur = 18;
+  ctx.fillRect(hx * CELL + 1, HUD_H + hy * CELL + 1, CELL - 2, CELL - 2);
+  ctx.shadowBlur = 0;
+}
+
+function drawHUD() {
+  ctx.fillStyle = "#050510";
+  ctx.fillRect(0, 0, WIDTH, HUD_H);
+  ctx.textBaseline = "middle";
+
+  ctx.textAlign = "left";
+  ctx.fillStyle = P1_COLOR;
+  ctx.font = "bold 30px Consolas, monospace";
+  ctx.fillText(scores[0], 24, HUD_H / 2);
+  ctx.font = "12px Consolas, monospace";
+  ctx.fillText("BLUE · WASD", 56, HUD_H / 2);
+
+  ctx.textAlign = "right";
+  ctx.fillStyle = P2_COLOR;
+  ctx.font = "bold 30px Consolas, monospace";
+  ctx.fillText(scores[1], WIDTH - 24, HUD_H / 2);
+  ctx.font = "12px Consolas, monospace";
+  ctx.fillText("ARROWS · GOLD", WIDTH - 56, HUD_H / 2);
+
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#8890a8";
+  ctx.font = "12px Consolas, monospace";
+  ctx.fillText("FIRST TO " + WIN_SCORE, WIDTH / 2, HUD_H / 2);
+}
+
+function centerText(lines) {
+  ctx.fillStyle = "rgba(5,5,16,0.78)";
+  ctx.fillRect(0, HUD_H, WIDTH, HEIGHT - HUD_H);
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  let y = HUD_H + (HEIGHT - HUD_H) / 2 - (lines.length - 1) * 26;
+  for (const ln of lines) {
+    ctx.fillStyle = ln.color || "#f0f0f0";
+    ctx.font = ln.font || "20px Consolas, monospace";
+    ctx.fillText(ln.text, WIDTH / 2, y);
+    y += ln.gap || 44;
+  }
+}
+
+function render() {
+  drawGrid();
+  if (players) for (const p of players) drawTrail(p);
+  drawHUD();
+
+  if (state === STATE.TITLE) {
+    centerText([
+      { text: "LIGHT-CYCLES", color: P2_COLOR, font: "bold 52px Consolas, monospace", gap: 60 },
+      { text: "Trap your rival in a wall of light.", color: "#8890a8", font: "16px Consolas, monospace", gap: 50 },
+      { text: "BLUE: W A S D        GOLD: ARROW KEYS", color: "#f0f0f0", font: "16px Consolas, monospace", gap: 50 },
+      { text: "PRESS ENTER", color: P1_COLOR, font: "bold 22px Consolas, monospace" },
+    ]);
+  } else if (state === STATE.ROUND_OVER) {
+    centerText([
+      { text: roundMsg, color: P2_COLOR, font: "bold 34px Consolas, monospace", gap: 56 },
+      { text: scores[0] + "  —  " + scores[1], color: "#f0f0f0", font: "26px Consolas, monospace", gap: 56 },
+      { text: "PRESS ENTER FOR NEXT ROUND", color: P1_COLOR, font: "16px Consolas, monospace" },
+    ]);
+  } else if (state === STATE.MATCH_OVER) {
+    const winner = scores[0] > scores[1] ? "BLUE WINS" : "GOLD WINS";
+    const col = scores[0] > scores[1] ? P1_COLOR : P2_COLOR;
+    centerText([
+      { text: winner, color: col, font: "bold 52px Consolas, monospace", gap: 60 },
+      { text: scores[0] + "  —  " + scores[1], color: "#f0f0f0", font: "26px Consolas, monospace", gap: 56 },
+      { text: "PRESS ENTER TO PLAY AGAIN", color: "#8890a8", font: "16px Consolas, monospace" },
+    ]);
+  }
+}
+
+// ---------------------------------------------------------------- loop
+function loop(ts) {
+  if (state === STATE.PLAY) {
+    if (!lastTick) lastTick = ts;
+    while (ts - lastTick >= TICK) {
+      step();
+      lastTick += TICK;
+    }
+  }
+  render();
+  requestAnimationFrame(loop);
+}
+
+resetMatch();
+state = STATE.TITLE;
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>

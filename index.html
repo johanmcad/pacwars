@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<!--
+  Game collection hub.
+
+  To add a game: drop its HTML into games/, then add one entry to the
+  GAMES array near the bottom of this file. Set "ready: false" for a
+  game that isn't playable yet to show a "COMING SOON" placeholder card.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ARCADE — Game Collection</title>
+<style>
+  :root {
+    --space:   #050510;
+    --space-2: #08081c;
+    --blue:    #408cff;
+    --blue-dim:#1a3a7a;
+    --yellow:  #ffe81f;       /* Star Wars logo yellow */
+    --white:   #f0f0f0;
+    --grey:    #8890a8;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    min-height: 100%;
+    background: var(--space);
+    color: var(--white);
+    font-family: Consolas, "Courier New", monospace;
+    overflow-x: hidden;
+  }
+
+  /* animated starfield sits behind everything */
+  #stars {
+    position: fixed;
+    inset: 0;
+    z-index: -1;
+    display: block;
+  }
+
+  .wrap {
+    max-width: 1100px;
+    margin: 0 auto;
+    padding: clamp(2rem, 6vw, 5rem) 1.25rem 4rem;
+  }
+
+  header { text-align: center; margin-bottom: clamp(2rem, 6vw, 4rem); }
+
+  .eyebrow {
+    letter-spacing: 0.5em;
+    font-size: 0.75rem;
+    color: var(--blue);
+    text-transform: uppercase;
+    margin: 0 0 0.75rem;
+    padding-left: 0.5em;
+  }
+
+  h1 {
+    margin: 0;
+    font-size: clamp(2.5rem, 11vw, 6rem);
+    line-height: 0.95;
+    font-weight: 900;
+    color: var(--yellow);
+    letter-spacing: 0.04em;
+    text-shadow: 0 0 28px rgba(255, 232, 31, 0.35);
+  }
+
+  .tagline {
+    margin: 1rem auto 0;
+    max-width: 38ch;
+    color: var(--grey);
+    font-size: 0.95rem;
+    line-height: 1.5;
+  }
+
+  /* card grid */
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    gap: 1.25rem;
+  }
+
+  .card {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    text-decoration: none;
+    color: inherit;
+    background: linear-gradient(160deg, var(--space-2), #04040f);
+    border: 1px solid var(--blue-dim);
+    border-radius: 14px;
+    padding: 1.5rem;
+    min-height: 200px;
+    overflow: hidden;
+    transition: transform .18s ease, border-color .18s ease, box-shadow .18s ease;
+  }
+
+  .card.live:hover {
+    transform: translateY(-4px);
+    border-color: var(--blue);
+    box-shadow: 0 0 40px rgba(64, 140, 255, 0.28);
+  }
+
+  /* glow blob */
+  .card::after {
+    content: "";
+    position: absolute;
+    top: -40%;
+    right: -30%;
+    width: 220px;
+    height: 220px;
+    background: radial-gradient(circle, var(--accent, var(--blue)) 0%, transparent 70%);
+    opacity: 0.12;
+    pointer-events: none;
+    transition: opacity .18s ease;
+  }
+  .card.live:hover::after { opacity: 0.3; }
+
+  .card .icon { font-size: 2.5rem; line-height: 1; margin-bottom: 0.85rem; }
+
+  .card h2 {
+    margin: 0 0 0.5rem;
+    font-size: 1.4rem;
+    color: var(--white);
+    letter-spacing: 0.02em;
+  }
+  .card.live h2 { color: var(--yellow); }
+
+  .card p {
+    margin: 0;
+    color: var(--grey);
+    font-size: 0.85rem;
+    line-height: 1.5;
+    flex: 1;
+  }
+
+  .tag {
+    align-self: flex-start;
+    margin-top: 1.1rem;
+    font-size: 0.7rem;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    padding: 0.35em 0.8em;
+    border-radius: 999px;
+    border: 1px solid currentColor;
+  }
+  .card.live  .tag { color: var(--blue); }
+  .card.soon  { opacity: 0.55; cursor: default; }
+  .card.soon  .tag { color: var(--grey); }
+
+  footer {
+    margin-top: 3.5rem;
+    text-align: center;
+    color: var(--grey);
+    font-size: 0.75rem;
+    letter-spacing: 0.15em;
+  }
+</style>
+</head>
+<body>
+<canvas id="stars"></canvas>
+
+<div class="wrap">
+  <header>
+    <p class="eyebrow">Johan's</p>
+    <h1>ARCADE</h1>
+    <p class="tagline">Simple, silly, 1-vs-1 browser games — grab a friend, share one keyboard, and duel. No install, no sign-up.</p>
+  </header>
+
+  <main class="grid" id="grid"></main>
+
+  <footer>BUILT FOR FUN · MORE GAMES INCOMING</footer>
+</div>
+
+<script>
+"use strict";
+
+// ---- add a game here -------------------------------------------------------
+// { title, href, icon, accent, desc, ready }
+const GAMES = [
+  {
+    title: "PAC-WARS",
+    href: "games/pacwars.html",
+    icon: "🚀",
+    accent: "#408cff",
+    desc: "A Star Wars-themed Pac-Man. Fly your X-wing through the Death Star, grab a core, and hunt the TIE fighters.",
+    ready: true,
+  },
+  {
+    title: "LIGHT-CYCLES",
+    href: "games/lightcycles.html",
+    icon: "🏍️",
+    accent: "#ffe81f",
+    desc: "A 1-vs-1 Tron duel on one keyboard. Leave a wall of light, box your rival in. Blue plays WASD, Gold plays the arrows.",
+    ready: true,
+  },
+  // Future games drop in here. Set ready:false to show a placeholder.
+  {
+    title: "???",
+    icon: "🕹️",
+    accent: "#ffe81f",
+    desc: "The next game is still in the hangar. Check back soon.",
+    ready: false,
+  },
+];
+// ---------------------------------------------------------------------------
+
+const grid = document.getElementById("grid");
+for (const g of GAMES) {
+  const live = g.ready && g.href;
+  const card = document.createElement(live ? "a" : "div");
+  card.className = "card " + (live ? "live" : "soon");
+  if (live) card.href = g.href;
+  card.style.setProperty("--accent", g.accent || "#408cff");
+  card.innerHTML = `
+    <div class="icon">${g.icon || "🎮"}</div>
+    <h2>${g.title}</h2>
+    <p>${g.desc || ""}</p>
+    <span class="tag">${live ? "Play ▸" : "Coming soon"}</span>`;
+  grid.appendChild(card);
+}
+
+// ---- animated starfield ----------------------------------------------------
+const canvas = document.getElementById("stars");
+const ctx = canvas.getContext("2d");
+let stars = [];
+
+function resize() {
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+  const count = Math.round((canvas.width * canvas.height) / 9000);
+  stars = Array.from({ length: count }, () => ({
+    x: Math.random() * canvas.width,
+    y: Math.random() * canvas.height,
+    r: Math.random() * 1.4 + 0.3,
+    s: Math.random() * 0.4 + 0.05,          // drift speed
+    tw: Math.random() * Math.PI * 2,        // twinkle phase
+  }));
+}
+
+function frame() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  for (const st of stars) {
+    st.y += st.s;
+    st.tw += 0.02;
+    if (st.y > canvas.height) { st.y = 0; st.x = Math.random() * canvas.width; }
+    const a = 0.4 + 0.6 * Math.abs(Math.sin(st.tw));
+    ctx.beginPath();
+    ctx.arc(st.x, st.y, st.r, 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(180, 205, 255, ${a})`;
+    ctx.fill();
+  }
+  requestAnimationFrame(frame);
+}
+
+window.addEventListener("resize", resize);
+resize();
+frame();
+</script>
+</body>
+</html>
