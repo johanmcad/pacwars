@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<!--
+  DRAG KINGS — 1v1 drag race. Shift gears at the peak of your RPM gauge
+  to gain speed. Miss the window and you bog out. Nail it perfectly and
+  get a nitro burst. First car over the line wins.
+
+  The cars are labeled PROD and STAGING — because deploying to production
+  is always a race.
+
+  Player 1 (blue, PROD):    W to shift up  ·  S to shift down
+  Player 2 (gold, STAGING): ↑ to shift up  ·  ↓ to shift down
+  Enter: start   ·   R: reset
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DRAG KINGS</title>
+<style>
+  html, body { margin:0; height:100%; background:#050510; color:#f0f0f0;
+    display:flex; align-items:center; justify-content:center;
+    font-family:Consolas,"Courier New",monospace; }
+  canvas { image-rendering:pixelated; box-shadow:0 0 40px rgba(64,140,255,0.25);
+    max-width:100vw; max-height:100vh; border-radius:6px; }
+  a.back { position:fixed; top:14px; left:16px; color:#8890a8; text-decoration:none;
+    font-size:.8rem; letter-spacing:.15em; }
+  a.back:hover { color:#408cff; }
+</style>
+</head>
+<body>
+<a class="back" href="../index.html">◂ ARCADE</a>
+<canvas id="game"></canvas>
+<script>
+"use strict";
+
+const WIDTH = 800, HEIGHT = 560, HUD_H = 64;
+const TRACK_LENGTH = 1200; // "meters" to finish
+const MAX_GEAR = 6;
+const GEAR_RATIOS = [0, 3.5, 2.4, 1.7, 1.3, 1.0, 0.82]; // gear 1-6
+
+// RPM thresholds (0-100 scale)
+const SHIFT_WINDOW = { low:72, high:88 }; // green zone
+const PERFECT_WINDOW = { low:80, high:86 }; // perfect zone (nitro)
+const RPM_RISE_SPEED = 0.8;  // per second when in gear
+const RPM_DROP = 0.6;        // on shift: drop to this fraction
+
+const P1_COLOR = "#3da0ff", P2_COLOR = "#ffe81f";
+
+const canvas = document.getElementById("game");
+canvas.width = WIDTH; canvas.height = HEIGHT;
+const ctx = canvas.getContext("2d");
+
+let audioCtx = null;
+function beep(freq, dur, type) {
+  try {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.type = type||"square"; o.frequency.value = freq;
+    o.connect(g); g.connect(audioCtx.destination);
+    g.gain.setValueAtTime(0.08, audioCtx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + dur);
+    o.start(); o.stop(audioCtx.currentTime + dur);
+  } catch(e) {}
+}
+
+const STATE = { TITLE:0, COUNTDOWN:1, RACE:2, FINISH:3 };
+let state = STATE.TITLE, cars, winner = null, countdown = 3;
+let countdownTimer = 0;
+
+const keys = {};
+window.addEventListener("keydown", e => {
+  if (["ArrowUp","ArrowDown"].includes(e.key)) e.preventDefault();
+  if (!keys[e.key]) { // on keydown, not held
+    if (state === STATE.RACE) {
+      if (e.key === "w" || e.key === "W") shiftUp(0);
+      if (e.key === "s" || e.key === "S") shiftDown(0);
+      if (e.key === "ArrowUp")   shiftUp(1);
+      if (e.key === "ArrowDown") shiftDown(1);
+    }
+    if (e.key === "Enter" && state !== STATE.RACE && state !== STATE.COUNTDOWN) startRace();
+    if (e.key === "r" || e.key === "R") state = STATE.TITLE;
+  }
+  keys[e.key] = true;
+});
+window.addEventListener("keyup", e => { keys[e.key] = false; });
+
+function makeCar(color, glow, label) {
+  return {
+    pos: 0, speed: 0, gear: 1, rpm: 10,
+    nitro: 0, bogMs: 0,
+    color, glow, label,
+    shiftMsg: "", shiftMsgTimer: 0,
+  };
+}
+
+function startRace() {
+  cars = [
+    makeCar(P1_COLOR, "rgba(61,160,255,0.9)", "PROD"),
+    makeCar(P2_COLOR, "rgba(255,232,31,0.9)", "STAGING"),
+  ];
+  winner = null;
+  countdown = 3;
+  countdownTimer = 0;
+  state = STATE.COUNTDOWN;
+}
+
+function shiftUp(idx) {
+  const c = cars[idx];
+  if (c.gear >= MAX_GEAR || state !== STATE.RACE) return;
+  const rpm = c.rpm;
+  if (rpm >= PERFECT_WINDOW.low && rpm <= PERFECT_WINDOW.high) {
+    // perfect shift
+    c.gear++;
+    c.rpm *= RPM_DROP * 1.05;
+    c.nitro = 1.5; // 1.5 second nitro
+    c.shiftMsg = "PERFECT!"; c.shiftMsgTimer = 1.5;
+    beep(880, 0.12, "square");
+  } else if (rpm >= SHIFT_WINDOW.low && rpm <= SHIFT_WINDOW.high) {
+    // good shift
+    c.gear++;
+    c.rpm *= RPM_DROP;
+    c.shiftMsg = "GOOD!"; c.shiftMsgTimer = 0.8;
+    beep(660, 0.08, "square");
+  } else if (rpm < SHIFT_WINDOW.low) {
+    // too early — slight penalty
+    c.gear++;
+    c.rpm *= RPM_DROP * 0.7;
+    c.shiftMsg = "TOO SOON"; c.shiftMsgTimer = 0.8;
+    beep(200, 0.15, "sawtooth");
+  } else {
+    // over-rev — bog
+    c.gear++;
+    c.rpm = 20;
+    c.bogMs = 0.6;
+    c.shiftMsg = "BOG!"; c.shiftMsgTimer = 1.0;
+    beep(110, 0.3, "sawtooth");
+  }
+}
+
+function shiftDown(idx) {
+  const c = cars[idx];
+  if (c.gear <= 1) return;
+  c.gear--;
+  c.rpm = Math.min(95, c.rpm * 1.3);
+  beep(300, 0.06, "square");
+}
+
+let lastTs = null;
+function update(ts) {
+  if (lastTs === null) { lastTs = ts; return; }
+  const dt = Math.min((ts-lastTs)/1000, 0.05);
+  lastTs = ts;
+
+  if (state === STATE.COUNTDOWN) {
+    countdownTimer += dt;
+    if (countdownTimer >= 1) {
+      countdown--;
+      countdownTimer = 0;
+      if (countdown <= 0) { state = STATE.RACE; beep(880,0.1,"square"); }
+      else beep(440, 0.1, "square");
+    }
+    return;
+  }
+  if (state !== STATE.RACE) return;
+
+  for (const c of cars) {
+    // RPM rises in current gear
+    if (c.bogMs > 0) { c.bogMs -= dt; }
+    else {
+      c.rpm = Math.min(100, c.rpm + RPM_RISE_SPEED * 100 * dt / GEAR_RATIOS[c.gear]);
+    }
+
+    // speed from rpm + gear
+    const baseSpeed = (c.rpm / 100) * 60 * GEAR_RATIOS[c.gear];
+    const nitroMult = c.nitro > 0 ? 1.35 : 1;
+    if (c.nitro > 0) c.nitro -= dt;
+    c.speed = baseSpeed * nitroMult;
+    c.pos += c.speed * dt;
+
+    if (c.shiftMsgTimer > 0) c.shiftMsgTimer -= dt;
+
+    if (c.pos >= TRACK_LENGTH && winner === null) {
+      winner = c;
+      state = STATE.FINISH;
+      beep(660, 0.1, "square");
+    }
+  }
+}
+
+function drawRPMGauge(cx, cy, rpm, gear, nitro, bogy) {
+  const R = 44;
+  // background arc
+  ctx.beginPath();
+  ctx.arc(cx, cy, R, Math.PI, 2*Math.PI);
+  ctx.strokeStyle = "#1a1a2e";
+  ctx.lineWidth = 10;
+  ctx.stroke();
+
+  // green zone
+  const toAngle = v => Math.PI + (v/100) * Math.PI;
+  ctx.beginPath();
+  ctx.arc(cx, cy, R, toAngle(SHIFT_WINDOW.low), toAngle(SHIFT_WINDOW.high));
+  ctx.strokeStyle = "#00cc44";
+  ctx.lineWidth = 10;
+  ctx.stroke();
+  // perfect zone
+  ctx.beginPath();
+  ctx.arc(cx, cy, R, toAngle(PERFECT_WINDOW.low), toAngle(PERFECT_WINDOW.high));
+  ctx.strokeStyle = "#ffff00";
+  ctx.lineWidth = 10;
+  ctx.stroke();
+
+  // RPM needle
+  const ang = Math.PI + (rpm/100) * Math.PI;
+  ctx.strokeStyle = bogy > 0 ? "#ff4040" : (nitro > 0 ? "#ffff00" : "#ffffff");
+  ctx.lineWidth = 3;
+  ctx.shadowColor = ctx.strokeStyle; ctx.shadowBlur = 8;
+  ctx.beginPath();
+  ctx.moveTo(cx, cy);
+  ctx.lineTo(cx + (R-6)*Math.cos(ang), cy + (R-6)*Math.sin(ang));
+  ctx.stroke();
+  ctx.shadowBlur = 0;
+
+  // gear label
+  ctx.fillStyle = "#f0f0f0";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.font = "bold 18px Consolas, monospace";
+  ctx.fillText("G"+gear, cx, cy + 14);
+}
+
+function render() {
+  ctx.fillStyle = "#09090f";
+  ctx.fillRect(0, 0, WIDTH, HEIGHT);
+
+  // asphalt track
+  const trackY1 = HUD_H + 40, trackY2 = HEIGHT - 40;
+  const laneH = (trackY2 - trackY1) / 2;
+  ctx.fillStyle = "#111118";
+  ctx.fillRect(0, trackY1, WIDTH, trackY2 - trackY1);
+
+  // lane divider
+  ctx.setLineDash([20,14]); ctx.strokeStyle = "rgba(255,255,0,0.15)"; ctx.lineWidth = 2;
+  const divY = trackY1 + laneH;
+  ctx.beginPath(); ctx.moveTo(0, divY); ctx.lineTo(WIDTH, divY); ctx.stroke();
+  ctx.setLineDash([]);
+
+  // finish line
+  const finishX = WIDTH - 30;
+  for (let i = 0; i < 8; i++) {
+    ctx.fillStyle = i%2===0 ? "#fff" : "#000";
+    ctx.fillRect(finishX, trackY1 + i * ((trackY2-trackY1)/8), 20, (trackY2-trackY1)/8);
+  }
+
+  if (!cars) {
+    drawTitleOverlay();
+    return;
+  }
+
+  // cars + gauges
+  for (let i = 0; i < 2; i++) {
+    const c = cars[i];
+    const carX = 60 + (c.pos / TRACK_LENGTH) * (finishX - 100);
+    const carY = trackY1 + laneH * i + laneH/2;
+
+    // car body
+    const cw = 48, ch = 22;
+    ctx.shadowColor = c.glow; ctx.shadowBlur = 20;
+    ctx.fillStyle = c.color;
+    ctx.fillRect(carX - cw/2, carY - ch/2, cw, ch);
+
+    // spoiler
+    ctx.fillStyle = c.color;
+    ctx.fillRect(carX - cw/2 - 8, carY - ch/2, 8, 6);
+
+    // wheels
+    ctx.fillStyle = "#333";
+    for (const wx of [carX - cw/2 + 8, carX + cw/2 - 8]) {
+      ctx.beginPath(); ctx.arc(wx, carY + ch/2, 6, 0, Math.PI*2); ctx.fill();
+      ctx.beginPath(); ctx.arc(wx, carY - ch/2, 6, 0, Math.PI*2); ctx.fill();
+    }
+    ctx.shadowBlur = 0;
+
+    // nitro flame
+    if (c.nitro > 0) {
+      ctx.shadowColor = "#ffaa00"; ctx.shadowBlur = 14;
+      ctx.fillStyle = `rgba(255,${120+Math.random()*80|0},0,0.8)`;
+      ctx.beginPath();
+      ctx.moveTo(carX - cw/2, carY - 5);
+      ctx.lineTo(carX - cw/2 - 18 - Math.random()*10, carY);
+      ctx.lineTo(carX - cw/2, carY + 5);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+    }
+
+    // label
+    ctx.fillStyle = "#000"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.font = "bold 9px Consolas,monospace";
+    ctx.fillText(c.label, carX, carY);
+
+    // shift message
+    if (c.shiftMsgTimer > 0) {
+      ctx.fillStyle = c.shiftMsg==="PERFECT!" ? "#ffff00" : c.shiftMsg==="GOOD!" ? "#00ee44" : "#ff4040";
+      ctx.font = "bold 14px Consolas,monospace"; ctx.textAlign = "center";
+      ctx.fillText(c.shiftMsg, carX, carY - 30);
+    }
+
+    // RPM gauge (left side)
+    const gaugeX = i===0 ? 70 : 70;
+    const gaugeY = i===0 ? trackY1 + laneH*0.5 : trackY1 + laneH*1.5;
+    drawRPMGauge(gaugeX, gaugeY, c.rpm, c.gear, c.nitro, c.bogMs);
+  }
+
+  // HUD
+  ctx.fillStyle = "#050510";
+  ctx.fillRect(0, 0, WIDTH, HUD_H);
+  ctx.textBaseline = "middle"; ctx.textAlign = "center";
+  ctx.fillStyle = "#8890a8"; ctx.font = "11px Consolas,monospace";
+  ctx.fillText("SHIFT IN THE GREEN ZONE — YELLOW ZONE = NITRO", WIDTH/2, HUD_H/2 - 12);
+  ctx.fillStyle = P1_COLOR; ctx.textAlign = "left"; ctx.font = "bold 14px Consolas,monospace";
+  ctx.fillText("PROD · W=shift↑  S=shift↓", 16, HUD_H/2 + 10);
+  ctx.fillStyle = P2_COLOR; ctx.textAlign = "right";
+  ctx.fillText("↑=shift↑  ↓=shift↓ · STAGING", WIDTH-16, HUD_H/2 + 10);
+
+  // countdown
+  if (state === STATE.COUNTDOWN) {
+    ctx.fillStyle = "rgba(5,5,16,0.6)";
+    ctx.fillRect(0, HUD_H, WIDTH, HEIGHT-HUD_H);
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillStyle = countdown<=1 ? "#ff4040" : "#ffe81f";
+    ctx.font = "bold 120px Consolas,monospace";
+    ctx.fillText(countdown > 0 ? countdown : "GO!", WIDTH/2, HUD_H + (HEIGHT-HUD_H)/2);
+  }
+
+  if (state === STATE.FINISH) {
+    const c = winner;
+    ctx.fillStyle = "rgba(5,5,16,0.75)";
+    ctx.fillRect(0, HUD_H, WIDTH, HEIGHT-HUD_H);
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.shadowColor = c.color; ctx.shadowBlur = 30;
+    ctx.fillStyle = c.color; ctx.font = "bold 52px Consolas,monospace";
+    ctx.fillText(c.label+" WINS!", WIDTH/2, HUD_H+(HEIGHT-HUD_H)/2 - 36);
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = "#8890a8"; ctx.font = "14px Consolas,monospace";
+    ctx.fillText("PRESS ENTER TO RACE AGAIN", WIDTH/2, HUD_H+(HEIGHT-HUD_H)/2 + 36);
+  }
+
+  if (state === STATE.TITLE) drawTitleOverlay();
+}
+
+function drawTitleOverlay() {
+  ctx.fillStyle = "rgba(5,5,16,0.82)";
+  ctx.fillRect(0, HUD_H, WIDTH, HEIGHT-HUD_H);
+  const lines = [
+    {text:"DRAG KINGS", color:"#ff6633", font:"bold 58px Consolas,monospace", gap:66},
+    {text:"PROD vs STAGING — shift gears in the green zone", color:"#8890a8", font:"13px Consolas,monospace", gap:48},
+    {text:"PROD: W=shift↑  S=shift↓        STAGING: ↑=shift↑  ↓=shift↓", color:"#f0f0f0", font:"13px Consolas,monospace", gap:50},
+    {text:"PRESS ENTER", color:P1_COLOR, font:"bold 22px Consolas,monospace"},
+  ];
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  let y = HUD_H + (HEIGHT-HUD_H)/2 - (lines.length-1)*24;
+  for (const ln of lines) {
+    ctx.fillStyle = ln.color; ctx.font = ln.font;
+    ctx.fillText(ln.text, WIDTH/2, y); y += ln.gap||46;
+  }
+}
+
+function loop(ts) { update(ts); render(); requestAnimationFrame(loop); }
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>

@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<!--
+  FIREWALL — 1v1 IT security duel. One player fires network packets at a
+  server rack. The other moves a firewall to block them. Roles swap every
+  round. Most points after 4 rounds wins.
+
+  ATTACKER fires packets: W/S to aim, Space to shoot (Blue)
+  DEFENDER blocks:        ↑/↓ to move firewall (Gold)
+  Roles swap each round. Enter: start · R: reset
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FIREWALL</title>
+<style>
+  html, body { margin:0; height:100%; background:#050510; color:#f0f0f0;
+    display:flex; align-items:center; justify-content:center;
+    font-family:Consolas,"Courier New",monospace; }
+  canvas { image-rendering:pixelated; box-shadow:0 0 40px rgba(64,140,255,0.25);
+    max-width:100vw; max-height:100vh; border-radius:6px; }
+  a.back { position:fixed; top:14px; left:16px; color:#8890a8; text-decoration:none;
+    font-size:.8rem; letter-spacing:.15em; }
+  a.back:hover { color:#408cff; }
+</style>
+</head>
+<body>
+<a class="back" href="../index.html">◂ ARCADE</a>
+<canvas id="game"></canvas>
+<script>
+"use strict";
+
+const WIDTH = 800, HEIGHT = 560, HUD_H = 64;
+const PLAY_H = HEIGHT - HUD_H;
+
+// Layout
+const ATK_X = 80;           // attacker aim position x
+const SERVER_X = WIDTH - 80; // server rack x
+const FW_X = WIDTH / 2;     // firewall x
+const FW_W = 18, FW_H = 110;
+const FW_SPEED = 400;
+
+// Packet types
+const PACKET_TYPES = [
+  { name:"HTTP",    color:"#3da0ff", speed:340, h:14, points:1 },
+  { name:"SSH",     color:"#a0ff3d", speed:520, h:10, points:2 },
+  { name:"MALWARE", color:"#ff3d3d", speed:240, h:22, points:3 },
+  { name:"PING",    color:"#ffcc00", speed:600, h:8,  points:1 },
+];
+
+const ROUND_TIME = 20;   // seconds per round
+const TOTAL_ROUNDS = 4;  // 2 rounds each attacking
+
+const P1_COLOR = "#3da0ff", P2_COLOR = "#ffe81f";
+const WIN_SCORE = 10;
+
+const canvas = document.getElementById("game");
+canvas.width = WIDTH; canvas.height = HEIGHT;
+const ctx = canvas.getContext("2d");
+
+let audioCtx = null;
+function beep(freq, dur, type) {
+  try {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.type = type||"square"; o.frequency.value = freq;
+    o.connect(g); g.connect(audioCtx.destination);
+    g.gain.setValueAtTime(0.07, audioCtx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + dur);
+    o.start(); o.stop(audioCtx.currentTime + dur);
+  } catch(e) {}
+}
+
+const STATE = { TITLE:0, PLAY:1, ROUND_END:2, MATCH_OVER:3 };
+let state = STATE.TITLE;
+let scores = [0,0], round = 0;
+let atkPlayer, defPlayer; // 0 or 1
+let aimY, fwY, packets, roundTimer, cooldown;
+let pktType = 0, shotsFired = 0;
+let roundMsg = "";
+
+const keys = {};
+window.addEventListener("keydown", e => {
+  keys[e.key] = true;
+  if (["ArrowUp","ArrowDown"," "].includes(e.key)) e.preventDefault();
+  if (e.key === "Enter") {
+    if (state === STATE.TITLE || state === STATE.MATCH_OVER) startMatch();
+    else if (state === STATE.ROUND_END) nextRound();
+  }
+  if (e.key === "r" || e.key === "R") state = STATE.TITLE;
+});
+window.addEventListener("keyup", e => { keys[e.key] = false; });
+
+function startMatch() {
+  scores = [0,0];
+  round = 0;
+  startRound();
+}
+
+function startRound() {
+  // alternate who attacks: even rounds P1 attacks, odd rounds P2 attacks
+  atkPlayer = round % 2 === 0 ? 0 : 1;
+  defPlayer = 1 - atkPlayer;
+  aimY = HUD_H + PLAY_H / 2;
+  fwY  = HUD_H + PLAY_H / 2 - FW_H / 2;
+  packets = [];
+  roundTimer = ROUND_TIME;
+  cooldown = 0;
+  pktType = 0;
+  shotsFired = 0;
+  state = STATE.PLAY;
+}
+
+function nextRound() {
+  round++;
+  if (round >= TOTAL_ROUNDS) { state = STATE.MATCH_OVER; return; }
+  startRound();
+}
+
+const SHOOT_COOLDOWN = 0.55;
+
+let lastTs = null;
+function update(ts) {
+  if (lastTs === null) { lastTs = ts; return; }
+  const dt = Math.min((ts-lastTs)/1000, 0.05);
+  lastTs = ts;
+  if (state !== STATE.PLAY) return;
+
+  roundTimer -= dt;
+  if (roundTimer <= 0) {
+    roundTimer = 0;
+    roundMsg = "ROUND "+(round+1)+" OVER";
+    state = STATE.ROUND_END;
+    return;
+  }
+
+  cooldown = Math.max(0, cooldown - dt);
+
+  // attacker controls (always P1=WASD/Space, P2=Arrows/Enter for their turn)
+  const atkUp   = atkPlayer===0 ? (keys.w||keys.W) : keys.ArrowUp;
+  const atkDown = atkPlayer===0 ? (keys.s||keys.S) : keys.ArrowDown;
+  const atkFire = atkPlayer===0 ? keys[" "] : (keys.Enter||keys.ArrowRight);
+
+  if (atkUp)   aimY = Math.max(HUD_H + 20, aimY - 350 * dt);
+  if (atkDown) aimY = Math.min(HEIGHT - 20, aimY + 350 * dt);
+
+  if (atkFire && cooldown <= 0) {
+    const t = PACKET_TYPES[pktType % PACKET_TYPES.length];
+    const aimDY = aimY - (HUD_H + PLAY_H / 2);
+    const dist = SERVER_X - ATK_X;
+    const vy = (aimDY / dist) * t.speed;
+    packets.push({
+      x: ATK_X + 20, y: aimY,
+      vx: t.speed, vy,
+      w: 36, h: t.h,
+      color: t.color, name: t.name, points: t.points,
+      alive: true,
+    });
+    pktType++;
+    cooldown = SHOOT_COOLDOWN;
+    beep(440, 0.06, "square");
+  }
+
+  // cycle packet type with A/D (attacker)
+  // (handled visually only — type cycles on each shot)
+
+  // defender controls
+  const defUp   = defPlayer===0 ? (keys.w||keys.W) : keys.ArrowUp;
+  const defDown = defPlayer===0 ? (keys.s||keys.S) : keys.ArrowDown;
+  if (defUp)   fwY = Math.max(HUD_H + 4, fwY - FW_SPEED * dt);
+  if (defDown) fwY = Math.min(HEIGHT - FW_H - 4, fwY + FW_SPEED * dt);
+
+  // move packets
+  for (const p of packets) {
+    if (!p.alive) continue;
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+
+    // firewall collision
+    if (p.x + p.w >= FW_X - FW_W/2 && p.x <= FW_X + FW_W/2 &&
+        p.y + p.h >= fwY && p.y <= fwY + FW_H) {
+      p.alive = false;
+      scores[defPlayer] += p.points;
+      beep(220, 0.12, "square");
+    }
+
+    // hit server
+    if (p.x >= SERVER_X - 10) {
+      p.alive = false;
+      scores[atkPlayer] += p.points;
+      beep(600, 0.1, "square");
+    }
+
+    // out of bounds
+    if (p.y < HUD_H || p.y > HEIGHT) p.alive = false;
+  }
+
+  packets = packets.filter(p => p.alive || p.x < SERVER_X + 20);
+}
+
+// server rack drawing
+function drawServer(x, cy, h) {
+  const w = 40, unitH = 18;
+  const units = Math.floor(h / unitH);
+  for (let i = 0; i < units; i++) {
+    const uy = cy - h/2 + i * unitH + 2;
+    ctx.fillStyle = i%3===0?"#141428":"#0e0e22";
+    ctx.fillRect(x - w/2, uy, w, unitH-2);
+    // activity LEDs
+    for (let j = 0; j < 3; j++) {
+      ctx.fillStyle = Math.random() > 0.3 ? "#00ff44" : "#004411";
+      ctx.fillRect(x - w/2 + 4 + j*7, uy + 6, 5, 5);
+    }
+    // drive slots
+    ctx.fillStyle = "#1a1a3a";
+    ctx.fillRect(x - w/2 + 4, uy + 2, w-8, 3);
+  }
+  ctx.strokeStyle = "rgba(64,140,255,0.4)"; ctx.lineWidth = 2;
+  ctx.strokeRect(x - w/2, cy - h/2, w, h);
+}
+
+function render() {
+  ctx.fillStyle = "#050510";
+  ctx.fillRect(0, 0, WIDTH, HEIGHT);
+
+  // network diagram bg
+  ctx.fillStyle = "#06060f";
+  ctx.fillRect(0, HUD_H, WIDTH, PLAY_H);
+
+  // connection lines (network aesthetic)
+  ctx.strokeStyle = "rgba(64,140,255,0.06)"; ctx.lineWidth = 1;
+  for (let i = 0; i < 6; i++) {
+    const y = HUD_H + (PLAY_H / 6) * i + PLAY_H/12;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(WIDTH, y); ctx.stroke();
+  }
+
+  // attacker side label
+  const atkColor = atkPlayer===0 ? P1_COLOR : P2_COLOR;
+  const defColor = defPlayer===0 ? P1_COLOR : P2_COLOR;
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillStyle = atkColor; ctx.font = "11px Consolas,monospace";
+  ctx.fillText("ATTACKER", ATK_X, HUD_H + 18);
+  ctx.fillStyle = defColor;
+  ctx.fillText("DEFENDER", FW_X, HUD_H + 18);
+  ctx.fillStyle = "#8890a8";
+  ctx.fillText("TARGET", SERVER_X, HUD_H + 18);
+
+  // attacker character (stylised hacker terminal)
+  ctx.fillStyle = atkColor; ctx.font = "bold 28px Consolas,monospace";
+  ctx.fillText(">_", ATK_X, aimY);
+  ctx.fillStyle = atkColor+"44";
+  ctx.beginPath(); ctx.arc(ATK_X, aimY, 18, 0, Math.PI*2); ctx.fill();
+
+  // aim line
+  ctx.setLineDash([6,8]); ctx.strokeStyle = atkColor+"55"; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(ATK_X+16, aimY); ctx.lineTo(FW_X-FW_W/2, aimY); ctx.stroke();
+  ctx.setLineDash([]);
+
+  // next packet preview
+  const nextT = PACKET_TYPES[pktType % PACKET_TYPES.length];
+  ctx.fillStyle = "#8890a8"; ctx.font = "10px Consolas,monospace"; ctx.textAlign = "left";
+  ctx.fillText("NEXT: "+nextT.name, ATK_X + 22, aimY - 24);
+
+  // server rack
+  drawServer(SERVER_X, HUD_H + PLAY_H/2, PLAY_H * 0.65);
+
+  // packets
+  for (const p of (packets||[])) {
+    if (!p.alive) continue;
+    ctx.shadowColor = p.color; ctx.shadowBlur = 10;
+    ctx.fillStyle = p.color;
+    ctx.fillRect(p.x, p.y - p.h/2, p.w, p.h);
+    ctx.fillStyle = "#000"; ctx.font = "8px Consolas,monospace";
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText(p.name, p.x + p.w/2, p.y);
+    ctx.shadowBlur = 0;
+  }
+
+  // firewall
+  const fwMid = fwY + FW_H/2;
+  ctx.shadowColor = defColor; ctx.shadowBlur = 20;
+  ctx.fillStyle = defColor;
+  ctx.fillRect(FW_X - FW_W/2, fwY, FW_W, FW_H);
+  ctx.fillStyle = "#000"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.font = "9px Consolas,monospace"; ctx.fillText("FW", FW_X, fwMid);
+  ctx.shadowBlur = 0;
+
+  // firewall tick marks (height guides)
+  ctx.strokeStyle = defColor+"33"; ctx.lineWidth = 1;
+  for (let y = HUD_H + 20; y < HEIGHT; y += 30) {
+    ctx.beginPath(); ctx.moveTo(FW_X - FW_W/2 - 6, y); ctx.lineTo(FW_X - FW_W/2, y); ctx.stroke();
+  }
+
+  // timer bar
+  const timerFrac = roundTimer / ROUND_TIME;
+  ctx.fillStyle = timerFrac > 0.3 ? "#3da0ff" : "#ff4040";
+  ctx.fillRect(0, HEIGHT - 4, WIDTH * timerFrac, 4);
+
+  // HUD
+  ctx.fillStyle = "#050510"; ctx.fillRect(0, 0, WIDTH, HUD_H);
+  ctx.textBaseline = "middle"; ctx.shadowBlur = 0;
+
+  ctx.font = "bold 28px Consolas,monospace";
+  ctx.textAlign = "left";  ctx.fillStyle = P1_COLOR; ctx.fillText(scores[0], 24, HUD_H/2);
+  ctx.font = "10px Consolas,monospace"; ctx.fillText("P1 BLUE", 62, HUD_H/2);
+  ctx.font = "bold 28px Consolas,monospace";
+  ctx.textAlign = "right"; ctx.fillStyle = P2_COLOR; ctx.fillText(scores[1], WIDTH-24, HUD_H/2);
+  ctx.font = "10px Consolas,monospace"; ctx.fillText("P2 GOLD", WIDTH-62, HUD_H/2);
+
+  ctx.textAlign = "center"; ctx.fillStyle = "#8890a8"; ctx.font = "10px Consolas,monospace";
+  ctx.fillText("ROUND "+(round+1)+"/"+TOTAL_ROUNDS+"   "+Math.ceil(roundTimer)+"s", WIDTH/2, HUD_H/2-8);
+  ctx.fillStyle = atkColor;
+  ctx.fillText("P"+(atkPlayer+1)+" ATTACKS · P"+(defPlayer+1)+" DEFENDS", WIDTH/2, HUD_H/2+8);
+
+  if (state === STATE.ROUND_END) {
+    showOverlay([
+      {text:roundMsg, color:P2_COLOR, font:"bold 34px Consolas,monospace", gap:54},
+      {text:"P1 BLUE: "+scores[0]+"    P2 GOLD: "+scores[1], color:"#f0f0f0", font:"22px Consolas,monospace", gap:50},
+      {text:"PRESS ENTER FOR NEXT ROUND", color:P1_COLOR, font:"14px Consolas,monospace"},
+    ]);
+  } else if (state === STATE.TITLE) {
+    showOverlay([
+      {text:"FIREWALL", color:"#ff4040", font:"bold 60px Consolas,monospace", gap:68},
+      {text:"Attacker fires packets · Defender blocks with the firewall", color:"#8890a8", font:"13px Consolas,monospace", gap:48},
+      {text:"ATTACKER: W/S aim  Space fire     DEFENDER: ↑/↓ move", color:"#f0f0f0", font:"13px Consolas,monospace", gap:50},
+      {text:"PRESS ENTER", color:P1_COLOR, font:"bold 22px Consolas,monospace"},
+    ]);
+  } else if (state === STATE.MATCH_OVER) {
+    const w = scores[0]>scores[1]?"P1 BLUE WINS":"P2 GOLD WINS";
+    const c = scores[0]>scores[1]?P1_COLOR:P2_COLOR;
+    showOverlay([
+      {text:w, color:c, font:"bold 50px Consolas,monospace", gap:64},
+      {text:scores[0]+" — "+scores[1], color:"#f0f0f0", font:"26px Consolas,monospace", gap:56},
+      {text:"PRESS ENTER TO PLAY AGAIN", color:"#8890a8", font:"14px Consolas,monospace"},
+    ]);
+  }
+}
+
+function showOverlay(lines) {
+  ctx.fillStyle = "rgba(5,5,16,0.8)";
+  ctx.fillRect(0, HUD_H, WIDTH, PLAY_H);
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  let y = HUD_H + PLAY_H/2 - (lines.length-1)*24;
+  for (const ln of lines) {
+    ctx.fillStyle = ln.color||"#f0f0f0"; ctx.font = ln.font||"18px Consolas,monospace";
+    ctx.fillText(ln.text, WIDTH/2, y); y += ln.gap||46;
+  }
+}
+
+function loop(ts) { update(ts); render(); requestAnimationFrame(loop); }
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>

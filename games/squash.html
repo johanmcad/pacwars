@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<!--
+  SQUASH — 1v1 court duel on a shared keyboard.
+
+  The court is split in two halves. Hit the ball to the front wall (top).
+  If the ball lands on the floor in YOUR half = opponent scores.
+  First to 7 wins.
+
+  Player 1 (blue, left half):  A / D
+  Player 2 (gold, right half): Arrow Left / Right
+  Enter: start   ·   R: reset match
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SQUASH</title>
+<style>
+  html, body { margin:0; height:100%; background:#050510; color:#f0f0f0;
+    display:flex; align-items:center; justify-content:center;
+    font-family:Consolas,"Courier New",monospace; }
+  canvas { image-rendering:pixelated; box-shadow:0 0 40px rgba(64,140,255,0.25);
+    max-width:100vw; max-height:100vh; border-radius:6px; }
+  a.back { position:fixed; top:14px; left:16px; color:#8890a8; text-decoration:none;
+    font-size:.8rem; letter-spacing:.15em; }
+  a.back:hover { color:#408cff; }
+</style>
+</head>
+<body>
+<a class="back" href="../index.html">◂ ARCADE</a>
+<canvas id="game"></canvas>
+<script>
+"use strict";
+
+const WIDTH = 700, HEIGHT = 560, HUD_H = 64;
+const PLAY_H = HEIGHT - HUD_H;
+const MID_X = WIDTH / 2;
+const PAD_W = 90, PAD_H = 14, PAD_SPEED = 520;
+const BALL_R = 10, WIN_SCORE = 7;
+const P1_COLOR = "#3da0ff", P2_COLOR = "#ffe81f";
+
+const canvas = document.getElementById("game");
+canvas.width = WIDTH; canvas.height = HEIGHT;
+const ctx = canvas.getContext("2d");
+
+let audioCtx = null;
+function beep(freq, dur, type) {
+  try {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.type = type || "square"; o.frequency.value = freq;
+    o.connect(g); g.connect(audioCtx.destination);
+    g.gain.setValueAtTime(0.07, audioCtx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + dur);
+    o.start(); o.stop(audioCtx.currentTime + dur);
+  } catch(e) {}
+}
+
+const STATE = { TITLE:0, PLAY:1, MATCH_OVER:2 };
+let state = STATE.TITLE, scores = [0,0], ball, pads;
+const keys = {};
+
+window.addEventListener("keydown", e => {
+  keys[e.key] = true;
+  if (["ArrowLeft","ArrowRight","ArrowUp","ArrowDown"].includes(e.key)) e.preventDefault();
+  if (e.key === "Enter" && state !== STATE.PLAY) resetMatch();
+  if (e.key === "r" || e.key === "R") state = STATE.TITLE;
+});
+window.addEventListener("keyup", e => { keys[e.key] = false; });
+
+function serve() {
+  const spd = 340;
+  const ang = Math.PI * (0.55 + Math.random() * 0.2); // between ~100°–136° (down+sideways)
+  ball = {
+    x: WIDTH / 2, y: HUD_H + 80,
+    vx: spd * Math.cos(ang) * (Math.random()<0.5?1:-1),
+    vy: Math.abs(spd * Math.sin(ang)),
+    spd,
+  };
+}
+
+function resetMatch() {
+  scores = [0,0];
+  pads = [
+    { x: MID_X/2 - PAD_W/2, y: HEIGHT - 22, color: P1_COLOR, glow:"rgba(61,160,255,0.9)" },
+    { x: MID_X + MID_X/2 - PAD_W/2, y: HEIGHT - 22, color: P2_COLOR, glow:"rgba(255,232,31,0.9)" },
+  ];
+  serve();
+  state = STATE.PLAY;
+}
+
+let lastTs = null;
+function update(ts) {
+  if (lastTs === null) { lastTs = ts; return; }
+  const dt = Math.min((ts - lastTs) / 1000, 0.05);
+  lastTs = ts;
+  if (state !== STATE.PLAY) return;
+
+  // pad movement (each player restricted to their half)
+  if ((keys.a || keys.A) && pads[0].x > 2) pads[0].x -= PAD_SPEED * dt;
+  if ((keys.d || keys.D) && pads[0].x + PAD_W < MID_X - 2) pads[0].x += PAD_SPEED * dt;
+  if (keys.ArrowLeft  && pads[1].x > MID_X + 2) pads[1].x -= PAD_SPEED * dt;
+  if (keys.ArrowRight && pads[1].x + PAD_W < WIDTH - 2) pads[1].x += PAD_SPEED * dt;
+
+  ball.x += ball.vx * dt;
+  ball.y += ball.vy * dt;
+
+  // side walls
+  if (ball.x - BALL_R < 0)     { ball.x = BALL_R; ball.vx = Math.abs(ball.vx); beep(280,0.04); }
+  if (ball.x + BALL_R > WIDTH)  { ball.x = WIDTH - BALL_R; ball.vx = -Math.abs(ball.vx); beep(280,0.04); }
+  // front wall (top)
+  if (ball.y - BALL_R < HUD_H) { ball.y = HUD_H + BALL_R; ball.vy = Math.abs(ball.vy); beep(500,0.05); }
+
+  // paddle hits
+  for (let i = 0; i < 2; i++) {
+    const p = pads[i];
+    if (ball.vy > 0 &&
+        ball.y + BALL_R >= p.y && ball.y - BALL_R <= p.y + PAD_H &&
+        ball.x + BALL_R >= p.x && ball.x - BALL_R <= p.x + PAD_W) {
+      const rel = (ball.x - (p.x + PAD_W/2)) / (PAD_W/2);
+      const angle = rel * (Math.PI/3.5);
+      ball.spd = Math.min(ball.spd * 1.06, 720);
+      ball.vx = ball.spd * Math.sin(angle);
+      ball.vy = -ball.spd * Math.cos(angle);
+      ball.y = p.y - BALL_R - 1;
+      beep(i===0?330:370, 0.07, "square");
+    }
+  }
+
+  // floor
+  if (ball.y - BALL_R > HEIGHT) {
+    if (ball.x < MID_X) scores[1]++; else scores[0]++;
+    beep(110, 0.4, "sawtooth");
+    if (scores[0] >= WIN_SCORE || scores[1] >= WIN_SCORE) state = STATE.MATCH_OVER;
+    else serve();
+  }
+}
+
+function render() {
+  ctx.fillStyle = "#06060f";
+  ctx.fillRect(0, HUD_H, WIDTH, PLAY_H);
+
+  // front wall glow
+  ctx.fillStyle = "rgba(64,140,255,0.18)";
+  ctx.fillRect(0, HUD_H, WIDTH, 7);
+
+  // court border
+  ctx.strokeStyle = "rgba(64,140,255,0.35)";
+  ctx.lineWidth = 3;
+  ctx.strokeRect(1.5, HUD_H+1.5, WIDTH-3, PLAY_H-3);
+
+  // centre divider (T-line)
+  ctx.setLineDash([6,8]); ctx.strokeStyle = "rgba(255,255,255,0.08)"; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(MID_X, HUD_H); ctx.lineTo(MID_X, HEIGHT); ctx.stroke();
+  ctx.setLineDash([]);
+
+  // zone labels
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.font = "10px Consolas, monospace"; ctx.fillStyle = "rgba(61,160,255,0.2)";
+  ctx.fillText("BLUE ZONE", MID_X/2, HUD_H + PLAY_H * 0.55);
+  ctx.fillStyle = "rgba(255,232,31,0.2)";
+  ctx.fillText("GOLD ZONE", MID_X + MID_X/2, HUD_H + PLAY_H * 0.55);
+
+  // HUD
+  ctx.fillStyle = "#050510";
+  ctx.fillRect(0, 0, WIDTH, HUD_H);
+  ctx.textBaseline = "middle";
+  ctx.font = "bold 30px Consolas, monospace";
+  ctx.textAlign = "left";  ctx.fillStyle = P1_COLOR; ctx.fillText(scores[0], 24, HUD_H/2);
+  ctx.font = "11px Consolas, monospace"; ctx.fillText("BLUE · A/D", 62, HUD_H/2);
+  ctx.font = "bold 30px Consolas, monospace";
+  ctx.textAlign = "right"; ctx.fillStyle = P2_COLOR; ctx.fillText(scores[1], WIDTH-24, HUD_H/2);
+  ctx.font = "11px Consolas, monospace"; ctx.fillText("ARROWS · GOLD", WIDTH-62, HUD_H/2);
+  ctx.textAlign = "center"; ctx.fillStyle = "#8890a8"; ctx.font = "11px Consolas, monospace";
+  ctx.fillText("FIRST TO "+WIN_SCORE, WIDTH/2, HUD_H/2);
+
+  // paddles
+  for (const p of (pads||[])) {
+    ctx.shadowColor = p.glow; ctx.shadowBlur = 18;
+    ctx.fillStyle = p.color; ctx.fillRect(p.x, p.y, PAD_W, PAD_H);
+    ctx.shadowBlur = 0;
+  }
+
+  // ball
+  if (ball) {
+    ctx.shadowColor = "rgba(255,255,255,0.9)"; ctx.shadowBlur = 20;
+    ctx.fillStyle = "#fff";
+    ctx.beginPath(); ctx.arc(ball.x, ball.y, BALL_R, 0, Math.PI*2); ctx.fill();
+    ctx.shadowBlur = 0;
+  }
+
+  if (state === STATE.TITLE) {
+    showOverlay([
+      {text:"SQUASH", color:P2_COLOR, font:"bold 60px Consolas,monospace", gap:68},
+      {text:"Ball in your half hits the floor — opponent scores", color:"#8890a8", font:"13px Consolas,monospace", gap:48},
+      {text:"BLUE: A / D          GOLD: ← / →", color:"#f0f0f0", font:"14px Consolas,monospace", gap:50},
+      {text:"PRESS ENTER", color:P1_COLOR, font:"bold 22px Consolas,monospace"},
+    ]);
+  } else if (state === STATE.MATCH_OVER) {
+    const w = scores[0]>scores[1]?"BLUE WINS":"GOLD WINS";
+    const c = scores[0]>scores[1]?P1_COLOR:P2_COLOR;
+    showOverlay([
+      {text:w, color:c, font:"bold 52px Consolas,monospace", gap:64},
+      {text:scores[0]+" — "+scores[1], color:"#f0f0f0", font:"26px Consolas,monospace", gap:56},
+      {text:"PRESS ENTER TO PLAY AGAIN", color:"#8890a8", font:"14px Consolas,monospace"},
+    ]);
+  }
+}
+
+function showOverlay(lines) {
+  ctx.fillStyle = "rgba(5,5,16,0.76)";
+  ctx.fillRect(0, HUD_H, WIDTH, PLAY_H);
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  let y = HUD_H + PLAY_H/2 - (lines.length-1)*24;
+  for (const ln of lines) {
+    ctx.fillStyle = ln.color||"#f0f0f0"; ctx.font = ln.font||"18px Consolas,monospace";
+    ctx.fillText(ln.text, WIDTH/2, y); y += ln.gap||46;
+  }
+}
+
+function loop(ts) { update(ts); render(); requestAnimationFrame(loop); }
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>

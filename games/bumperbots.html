@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<!--
+  BUMPER BOTS — 1v1 arena brawl in a server room. Two maintenance robots
+  slam into each other. Ram your opponent into the walls to score.
+  First to 5 hits wins.
+
+  Player 1 (blue):   W / A / S / D  (thrust in that direction)
+  Player 2 (gold):   Arrow keys
+  Enter: start   ·   R: reset
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BUMPER BOTS</title>
+<style>
+  html, body { margin:0; height:100%; background:#050510; color:#f0f0f0;
+    display:flex; align-items:center; justify-content:center;
+    font-family:Consolas,"Courier New",monospace; }
+  canvas { image-rendering:pixelated; box-shadow:0 0 40px rgba(64,140,255,0.25);
+    max-width:100vw; max-height:100vh; border-radius:6px; }
+  a.back { position:fixed; top:14px; left:16px; color:#8890a8; text-decoration:none;
+    font-size:.8rem; letter-spacing:.15em; }
+  a.back:hover { color:#408cff; }
+</style>
+</head>
+<body>
+<a class="back" href="../index.html">◂ ARCADE</a>
+<canvas id="game"></canvas>
+<script>
+"use strict";
+
+const WIDTH = 760, HEIGHT = 560, HUD_H = 64;
+const ARENA_X = 40, ARENA_Y = HUD_H + 30;
+const ARENA_W = WIDTH - 80, ARENA_H = HEIGHT - HUD_H - 60;
+const ARENA_R = Math.min(ARENA_W, ARENA_H) / 2;
+const ARENA_CX = WIDTH / 2, ARENA_CY = HUD_H + 30 + ARENA_H / 2;
+
+const BOT_R = 22;
+const THRUST = 600;
+const FRICTION = 0.015; // velocity multiplier per frame at 60fps
+const WALL_BOUNCE = 0.55;
+const BOT_BOUNCE = 0.7;
+const WALL_HIT_SPEED = 180; // minimum speed to count as a wall hit
+const WIN_SCORE = 5;
+const P1_COLOR = "#3da0ff", P2_COLOR = "#ffe81f";
+
+const canvas = document.getElementById("game");
+canvas.width = WIDTH; canvas.height = HEIGHT;
+const ctx = canvas.getContext("2d");
+
+let audioCtx = null;
+function beep(freq, dur, type) {
+  try {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.type = type||"square"; o.frequency.value = freq;
+    o.connect(g); g.connect(audioCtx.destination);
+    g.gain.setValueAtTime(0.09, audioCtx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + dur);
+    o.start(); o.stop(audioCtx.currentTime + dur);
+  } catch(e) {}
+}
+
+const STATE = { TITLE:0, PLAY:1, MATCH_OVER:2 };
+let state = STATE.TITLE, scores = [0,0], bots;
+let flashTimer = [0, 0]; // wall-hit flash
+
+const keys = {};
+window.addEventListener("keydown", e => {
+  keys[e.key] = true;
+  if (["ArrowUp","ArrowDown","ArrowLeft","ArrowRight"].includes(e.key)) e.preventDefault();
+  if (e.key === "Enter" && state !== STATE.PLAY) resetMatch();
+  if (e.key === "r" || e.key === "R") state = STATE.TITLE;
+});
+window.addEventListener("keyup", e => { keys[e.key] = false; });
+
+function makeBot(x, y, color, glow, label) {
+  return { x, y, vx:0, vy:0, color, glow, label };
+}
+
+function resetMatch() {
+  scores = [0,0];
+  flashTimer = [0,0];
+  spawnBots();
+  state = STATE.PLAY;
+}
+
+function spawnBots() {
+  bots = [
+    makeBot(ARENA_CX - ARENA_R*0.45, ARENA_CY, P1_COLOR, "rgba(61,160,255,0.9)", "BOT-1"),
+    makeBot(ARENA_CX + ARENA_R*0.45, ARENA_CY, P2_COLOR, "rgba(255,232,31,0.9)", "BOT-2"),
+  ];
+}
+
+let lastTs = null;
+function update(ts) {
+  if (lastTs === null) { lastTs = ts; return; }
+  const dt = Math.min((ts-lastTs)/1000, 0.05);
+  lastTs = ts;
+  if (state !== STATE.PLAY) return;
+
+  flashTimer[0] = Math.max(0, flashTimer[0] - dt);
+  flashTimer[1] = Math.max(0, flashTimer[1] - dt);
+
+  // thrust
+  if (keys.w || keys.W) bots[0].vy -= THRUST * dt;
+  if (keys.s || keys.S) bots[0].vy += THRUST * dt;
+  if (keys.a || keys.A) bots[0].vx -= THRUST * dt;
+  if (keys.d || keys.D) bots[0].vx += THRUST * dt;
+  if (keys.ArrowUp)    bots[1].vy -= THRUST * dt;
+  if (keys.ArrowDown)  bots[1].vy += THRUST * dt;
+  if (keys.ArrowLeft)  bots[1].vx -= THRUST * dt;
+  if (keys.ArrowRight) bots[1].vx += THRUST * dt;
+
+  for (const b of bots) {
+    b.x += b.vx * dt;
+    b.y += b.vy * dt;
+    // friction
+    const fric = Math.pow(FRICTION, dt * 60);
+    b.vx *= (1 - fric);
+    b.vy *= (1 - fric);
+  }
+
+  // circular arena wall collision
+  for (let i = 0; i < 2; i++) {
+    const b = bots[i];
+    const dx = b.x - ARENA_CX, dy = b.y - ARENA_CY;
+    const dist = Math.sqrt(dx*dx + dy*dy);
+    const limit = ARENA_R - BOT_R;
+    if (dist > limit) {
+      const nx = dx/dist, ny = dy/dist;
+      b.x = ARENA_CX + nx * limit;
+      b.y = ARENA_CY + ny * limit;
+      const spd = Math.sqrt(b.vx*b.vx + b.vy*b.vy);
+      const dot = b.vx*nx + b.vy*ny;
+      b.vx = (b.vx - 2*dot*nx) * WALL_BOUNCE;
+      b.vy = (b.vy - 2*dot*ny) * WALL_BOUNCE;
+      if (spd > WALL_HIT_SPEED) {
+        scores[1-i]++;
+        flashTimer[i] = 0.4;
+        beep(110, 0.35, "sawtooth");
+        if (scores[0] >= WIN_SCORE || scores[1] >= WIN_SCORE) { state = STATE.MATCH_OVER; return; }
+        spawnBots(); return;
+      }
+    }
+  }
+
+  // bot-bot collision
+  const dx = bots[1].x - bots[0].x;
+  const dy = bots[1].y - bots[0].y;
+  const dist = Math.sqrt(dx*dx + dy*dy);
+  if (dist < BOT_R * 2) {
+    const nx = dx/dist, ny = dy/dist;
+    // separate
+    const overlap = BOT_R*2 - dist;
+    bots[0].x -= nx * overlap/2;
+    bots[0].y -= ny * overlap/2;
+    bots[1].x += nx * overlap/2;
+    bots[1].y += ny * overlap/2;
+    // exchange velocity component along normal
+    const dv = (bots[1].vx - bots[0].vx)*nx + (bots[1].vy - bots[0].vy)*ny;
+    if (dv < 0) { // approaching
+      bots[0].vx += dv * nx * BOT_BOUNCE;
+      bots[0].vy += dv * ny * BOT_BOUNCE;
+      bots[1].vx -= dv * nx * BOT_BOUNCE;
+      bots[1].vy -= dv * ny * BOT_BOUNCE;
+      beep(300, 0.08, "square");
+    }
+  }
+}
+
+function render() {
+  ctx.fillStyle = "#050510";
+  ctx.fillRect(0, 0, WIDTH, HEIGHT);
+
+  // arena floor (circle)
+  ctx.beginPath(); ctx.arc(ARENA_CX, ARENA_CY, ARENA_R, 0, Math.PI*2);
+  ctx.fillStyle = "#0a0a18"; ctx.fill();
+
+  // server-room grid
+  ctx.save(); ctx.clip();
+  ctx.strokeStyle = "rgba(64,140,255,0.06)"; ctx.lineWidth = 1;
+  const GRID = 32;
+  for (let x = ARENA_CX - ARENA_R; x < ARENA_CX + ARENA_R; x += GRID) {
+    ctx.beginPath(); ctx.moveTo(x, ARENA_CY - ARENA_R); ctx.lineTo(x, ARENA_CY + ARENA_R); ctx.stroke();
+  }
+  for (let y = ARENA_CY - ARENA_R; y < ARENA_CY + ARENA_R; y += GRID) {
+    ctx.beginPath(); ctx.moveTo(ARENA_CX - ARENA_R, y); ctx.lineTo(ARENA_CX + ARENA_R, y); ctx.stroke();
+  }
+  ctx.restore();
+
+  // arena wall
+  ctx.beginPath(); ctx.arc(ARENA_CX, ARENA_CY, ARENA_R, 0, Math.PI*2);
+  ctx.strokeStyle = "rgba(64,140,255,0.4)"; ctx.lineWidth = 4; ctx.stroke();
+  ctx.shadowColor = "rgba(64,140,255,0.3)"; ctx.shadowBlur = 12; ctx.stroke();
+  ctx.shadowBlur = 0;
+
+  // SERVER ROOM label
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillStyle = "rgba(64,140,255,0.15)"; ctx.font = "bold 20px Consolas,monospace";
+  ctx.fillText("SERVER ROOM", ARENA_CX, ARENA_CY);
+
+  // bots
+  for (let i = 0; i < 2; i++) {
+    if (!bots) break;
+    const b = bots[i];
+    const flash = flashTimer[i] > 0;
+    ctx.shadowColor = flash ? "#ff4040" : b.glow; ctx.shadowBlur = flash ? 30 : 20;
+    ctx.fillStyle = flash ? "#ff4040" : b.color;
+    // bot body (square robot)
+    ctx.fillRect(b.x - BOT_R, b.y - BOT_R, BOT_R*2, BOT_R*2);
+    // antennae
+    ctx.fillStyle = flash ? "#ff8080" : b.color;
+    ctx.fillRect(b.x - 5, b.y - BOT_R - 8, 4, 8);
+    ctx.fillRect(b.x + 2, b.y - BOT_R - 6, 4, 6);
+    // eyes
+    ctx.fillStyle = "#000";
+    ctx.fillRect(b.x - 8, b.y - 5, 6, 6);
+    ctx.fillRect(b.x + 2, b.y - 5, 6, 6);
+    ctx.shadowBlur = 0;
+
+    // label
+    ctx.fillStyle = b.color; ctx.font = "bold 10px Consolas,monospace";
+    ctx.fillText(b.label, b.x, b.y + BOT_R + 12);
+
+    // velocity arrow
+    const spd = Math.sqrt(b.vx*b.vx + b.vy*b.vy);
+    if (spd > 30) {
+      const len = Math.min(spd / 6, 30);
+      ctx.strokeStyle = b.color; ctx.lineWidth = 2; ctx.globalAlpha = 0.4;
+      ctx.beginPath(); ctx.moveTo(b.x, b.y);
+      ctx.lineTo(b.x + (b.vx/spd)*len, b.y + (b.vy/spd)*len);
+      ctx.stroke(); ctx.globalAlpha = 1;
+    }
+  }
+
+  // HUD
+  ctx.fillStyle = "#050510";
+  ctx.fillRect(0, 0, WIDTH, HUD_H);
+  ctx.textBaseline = "middle";
+  ctx.font = "bold 30px Consolas,monospace";
+  ctx.textAlign = "left"; ctx.fillStyle = P1_COLOR; ctx.fillText(scores[0], 24, HUD_H/2);
+  ctx.font = "11px Consolas,monospace"; ctx.fillText("BLUE · WASD", 62, HUD_H/2);
+  ctx.font = "bold 30px Consolas,monospace";
+  ctx.textAlign = "right"; ctx.fillStyle = P2_COLOR; ctx.fillText(scores[1], WIDTH-24, HUD_H/2);
+  ctx.font = "11px Consolas,monospace"; ctx.fillText("ARROWS · GOLD", WIDTH-62, HUD_H/2);
+  ctx.textAlign = "center"; ctx.fillStyle = "#8890a8"; ctx.font = "11px Consolas,monospace";
+  ctx.fillText("RAM OPPONENT INTO WALL · FIRST TO "+WIN_SCORE, WIDTH/2, HUD_H/2);
+
+  if (state === STATE.TITLE || !bots) {
+    showOverlay([
+      {text:"BUMPER BOTS", color:P1_COLOR, font:"bold 52px Consolas,monospace", gap:62},
+      {text:"Two maintenance bots in a server room. Ram them into the wall.", color:"#8890a8", font:"13px Consolas,monospace", gap:48},
+      {text:"BLUE: WASD          GOLD: ARROW KEYS", color:"#f0f0f0", font:"14px Consolas,monospace", gap:50},
+      {text:"PRESS ENTER", color:P2_COLOR, font:"bold 22px Consolas,monospace"},
+    ]);
+  } else if (state === STATE.MATCH_OVER) {
+    const w = scores[0]>scores[1]?"BLUE WINS":"GOLD WINS";
+    const c = scores[0]>scores[1]?P1_COLOR:P2_COLOR;
+    showOverlay([
+      {text:w, color:c, font:"bold 52px Consolas,monospace", gap:64},
+      {text:scores[0]+" — "+scores[1], color:"#f0f0f0", font:"26px Consolas,monospace", gap:56},
+      {text:"PRESS ENTER TO PLAY AGAIN", color:"#8890a8", font:"14px Consolas,monospace"},
+    ]);
+  }
+}
+
+function showOverlay(lines) {
+  ctx.fillStyle = "rgba(5,5,16,0.78)";
+  ctx.fillRect(0, HUD_H, WIDTH, HEIGHT-HUD_H);
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  let y = HUD_H + (HEIGHT-HUD_H)/2 - (lines.length-1)*24;
+  for (const ln of lines) {
+    ctx.fillStyle = ln.color||"#f0f0f0"; ctx.font = ln.font||"18px Consolas,monospace";
+    ctx.fillText(ln.text, WIDTH/2, y); y += ln.gap||46;
+  }
+}
+
+function loop(ts) { update(ts); render(); requestAnimationFrame(loop); }
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>

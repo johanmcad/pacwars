@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<!--
+  SMASH — 1v1 badminton duel. The shuttlecock has real gravity and must arc
+  OVER the net. Hold your direction key for a soft lob; time a fast hit for
+  a smash that angles steeply down. First to 7.
+
+  Player 1 (blue, left):   W / S to move  +  D to hit/smash
+  Player 2 (gold, right):  ↑ / ↓ to move  +  ← to hit/smash
+  Enter: start   ·   R: reset match
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SMASH</title>
+<style>
+  html, body { margin:0; height:100%; background:#050510; color:#f0f0f0;
+    display:flex; align-items:center; justify-content:center;
+    font-family:Consolas,"Courier New",monospace; }
+  canvas { image-rendering:pixelated; box-shadow:0 0 40px rgba(64,140,255,0.25);
+    max-width:100vw; max-height:100vh; border-radius:6px; }
+  a.back { position:fixed; top:14px; left:16px; color:#8890a8; text-decoration:none;
+    font-size:.8rem; letter-spacing:.15em; }
+  a.back:hover { color:#408cff; }
+</style>
+</head>
+<body>
+<a class="back" href="../index.html">◂ ARCADE</a>
+<canvas id="game"></canvas>
+<script>
+"use strict";
+
+const WIDTH = 800, HEIGHT = 560, HUD_H = 64;
+const PLAY_H = HEIGHT - HUD_H;
+const NET_X = WIDTH / 2;
+const NET_W = 8;
+const NET_H = PLAY_H * 0.38 | 0;  // net height from floor
+const NET_TOP = HEIGHT - NET_H;    // y of net top
+
+const COURT_FLOOR = HEIGHT - 14;
+const PAD_W = 14, PAD_H = 70, PAD_SPEED = 420;
+const BALL_R = 9;
+const GRAVITY = 480;
+const WIN_SCORE = 7;
+const P1_COLOR = "#3da0ff", P2_COLOR = "#ffe81f";
+
+const canvas = document.getElementById("game");
+canvas.width = WIDTH; canvas.height = HEIGHT;
+const ctx = canvas.getContext("2d");
+
+let audioCtx = null;
+function beep(freq, dur, type) {
+  try {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.type = type || "square"; o.frequency.value = freq;
+    o.connect(g); g.connect(audioCtx.destination);
+    g.gain.setValueAtTime(0.08, audioCtx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + dur);
+    o.start(); o.stop(audioCtx.currentTime + dur);
+  } catch(e) {}
+}
+
+const STATE = { TITLE:0, PLAY:1, MATCH_OVER:2 };
+let state = STATE.TITLE, scores = [0,0], ball, pads, inPlay = false;
+const keys = {};
+
+window.addEventListener("keydown", e => {
+  keys[e.key] = true;
+  if (["ArrowUp","ArrowDown","ArrowLeft","ArrowRight"," "].includes(e.key)) e.preventDefault();
+  if (e.key === "Enter" && state !== STATE.PLAY) resetMatch();
+  if (e.key === "r" || e.key === "R") state = STATE.TITLE;
+});
+window.addEventListener("keyup", e => { keys[e.key] = false; });
+
+function makePad(x, y, color, glow) { return { x, y, color, glow, vy:0 }; }
+
+function resetMatch() {
+  scores = [0,0];
+  pads = [
+    makePad(50, HUD_H + PLAY_H/2 - PAD_H/2, P1_COLOR, "rgba(61,160,255,0.9)"),
+    makePad(WIDTH - 50 - PAD_W, HUD_H + PLAY_H/2 - PAD_H/2, P2_COLOR, "rgba(255,232,31,0.9)"),
+  ];
+  serve(0);
+  state = STATE.PLAY;
+}
+
+function serve(toPlayer) {
+  const dir = toPlayer === 0 ? 1 : -1;
+  ball = {
+    x: toPlayer === 0 ? 160 : WIDTH - 160,
+    y: HUD_H + PLAY_H * 0.35,
+    vx: dir * 320,
+    vy: -60,
+    inPlay: true,
+  };
+}
+
+function hitBall(padIdx) {
+  const p = pads[padIdx];
+  const dir = padIdx === 0 ? 1 : -1;
+  const rel = (ball.y - (p.y + PAD_H/2)) / (PAD_H/2); // -1..1
+  const speed = 480 + Math.random() * 80;
+  ball.vx = dir * speed;
+  ball.vy = rel * speed * 0.6 - 80; // upward bias + angle
+  beep(padIdx===0?380:350, 0.08, "square");
+}
+
+let lastTs = null;
+function update(ts) {
+  if (lastTs === null) { lastTs = ts; return; }
+  const dt = Math.min((ts-lastTs)/1000, 0.05);
+  lastTs = ts;
+  if (state !== STATE.PLAY) return;
+
+  // move pads
+  const p0 = pads[0], p1 = pads[1];
+  if ((keys.w || keys.W) && p0.y > HUD_H) p0.y -= PAD_SPEED * dt;
+  if ((keys.s || keys.S) && p0.y + PAD_H < COURT_FLOOR) p0.y += PAD_SPEED * dt;
+  if (keys.ArrowUp   && p1.y > HUD_H) p1.y -= PAD_SPEED * dt;
+  if (keys.ArrowDown && p1.y + PAD_H < COURT_FLOOR) p1.y += PAD_SPEED * dt;
+
+  // hit key pressed — only works when shuttle is close
+  const HIT_RANGE = 120;
+  if ((keys.d || keys.D) && ball.x - p0.x < HIT_RANGE && ball.x > p0.x) hitBall(0);
+  if (keys.ArrowLeft && p1.x - ball.x < HIT_RANGE && ball.x < p1.x) hitBall(1);
+
+  // shuttle physics
+  ball.vy += GRAVITY * dt;
+  ball.vx *= Math.pow(0.995, dt * 60); // feather drag
+  ball.x += ball.vx * dt;
+  ball.y += ball.vy * dt;
+
+  // ceiling bounce
+  if (ball.y - BALL_R < HUD_H) { ball.y = HUD_H + BALL_R; ball.vy = Math.abs(ball.vy)*0.6; beep(300,0.04); }
+
+  // side walls (out of bounds)
+  if (ball.x - BALL_R < 0)    fault(1); // P1 hit it out left
+  if (ball.x + BALL_R > WIDTH) fault(0); // P2 hit it out right
+
+  // net collision
+  if (ball.x + BALL_R >= NET_X - NET_W/2 &&
+      ball.x - BALL_R <= NET_X + NET_W/2 &&
+      ball.y >= NET_TOP) {
+    // which side was it heading to?
+    fault(ball.vx > 0 ? 0 : 1);
+  }
+
+  // paddle auto-collision (shuttle bounces off paddle body without needing hit key)
+  for (let i = 0; i < 2; i++) {
+    const p = pads[i];
+    if (ball.x + BALL_R >= p.x && ball.x - BALL_R <= p.x + PAD_W &&
+        ball.y + BALL_R >= p.y && ball.y - BALL_R <= p.y + PAD_H) {
+      const dir = i === 0 ? 1 : -1;
+      if (Math.sign(ball.vx) !== dir) hitBall(i);
+    }
+  }
+
+  // floor
+  if (ball.y + BALL_R > COURT_FLOOR) {
+    // which side did it land on?
+    fault(ball.x < NET_X ? 0 : 1);
+  }
+}
+
+function fault(losingPlayer) {
+  scores[1 - losingPlayer]++;
+  beep(110, 0.45, "sawtooth");
+  if (scores[0] >= WIN_SCORE || scores[1] >= WIN_SCORE) state = STATE.MATCH_OVER;
+  else serve(losingPlayer); // loser serves
+}
+
+function render() {
+  // background — green court
+  ctx.fillStyle = "#031a08";
+  ctx.fillRect(0, HUD_H, WIDTH, PLAY_H);
+
+  // court lines
+  ctx.strokeStyle = "rgba(80,200,80,0.2)";
+  ctx.lineWidth = 2;
+  ctx.strokeRect(20, HUD_H + 10, WIDTH - 40, COURT_FLOOR - HUD_H - 10);
+
+  // short service line
+  ctx.setLineDash([4,6]);
+  ctx.beginPath(); ctx.moveTo(NET_X - 120, HUD_H+10); ctx.lineTo(NET_X - 120, COURT_FLOOR); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(NET_X + 120, HUD_H+10); ctx.lineTo(NET_X + 120, COURT_FLOOR); ctx.stroke();
+  ctx.setLineDash([]);
+
+  // net post
+  ctx.fillStyle = "rgba(80,200,80,0.4)";
+  ctx.fillRect(NET_X - NET_W/2, NET_TOP, NET_W, NET_H);
+  ctx.fillStyle = "rgba(100,240,100,0.6)";
+  ctx.fillRect(NET_X - NET_W/2, NET_TOP, NET_W, 3);
+
+  // floor line
+  ctx.fillStyle = "rgba(80,200,80,0.25)";
+  ctx.fillRect(0, COURT_FLOOR, WIDTH, 3);
+
+  // HUD
+  ctx.fillStyle = "#050510";
+  ctx.fillRect(0, 0, WIDTH, HUD_H);
+  ctx.textBaseline = "middle";
+  ctx.font = "bold 30px Consolas, monospace";
+  ctx.textAlign = "left";  ctx.fillStyle = P1_COLOR; ctx.fillText(scores[0], 24, HUD_H/2);
+  ctx.font = "11px Consolas, monospace"; ctx.fillText("BLUE · W/S + D", 62, HUD_H/2);
+  ctx.font = "bold 30px Consolas, monospace";
+  ctx.textAlign = "right"; ctx.fillStyle = P2_COLOR; ctx.fillText(scores[1], WIDTH-24, HUD_H/2);
+  ctx.font = "11px Consolas, monospace"; ctx.fillText("↑/↓ + ← · GOLD", WIDTH-62, HUD_H/2);
+  ctx.textAlign = "center"; ctx.fillStyle = "#8890a8"; ctx.font = "11px Consolas, monospace";
+  ctx.fillText("FIRST TO "+WIN_SCORE, WIDTH/2, HUD_H/2);
+
+  // paddles
+  for (const p of (pads||[])) {
+    ctx.shadowColor = p.glow; ctx.shadowBlur = 16;
+    ctx.fillStyle = p.color;
+    // racket head (oval)
+    ctx.beginPath();
+    ctx.ellipse(p.x + PAD_W/2, p.y + PAD_H/2, PAD_W/2+4, PAD_H/2, 0, 0, Math.PI*2);
+    ctx.fill();
+    ctx.shadowBlur = 0;
+  }
+
+  // shuttle
+  if (ball) {
+    ctx.shadowColor = "#fff"; ctx.shadowBlur = 16;
+    ctx.fillStyle = "#fff";
+    ctx.beginPath(); ctx.arc(ball.x, ball.y, BALL_R, 0, Math.PI*2); ctx.fill();
+    // feather cone
+    ctx.fillStyle = "rgba(200,200,200,0.6)";
+    ctx.beginPath();
+    const tailDir = ball.vx >= 0 ? -1 : 1;
+    ctx.moveTo(ball.x, ball.y);
+    ctx.lineTo(ball.x + tailDir*22, ball.y - 8);
+    ctx.lineTo(ball.x + tailDir*22, ball.y + 8);
+    ctx.closePath(); ctx.fill();
+    ctx.shadowBlur = 0;
+  }
+
+  if (state === STATE.TITLE) {
+    showOverlay([
+      {text:"SMASH", color:"#50e850", font:"bold 68px Consolas,monospace", gap:72},
+      {text:"Arc the shuttle OVER the net. Nail the landing.", color:"#8890a8", font:"13px Consolas,monospace", gap:48},
+      {text:"BLUE: W/S move  D=hit     GOLD: ↑/↓ move  ←=hit", color:"#f0f0f0", font:"13px Consolas,monospace", gap:50},
+      {text:"PRESS ENTER", color:P1_COLOR, font:"bold 22px Consolas,monospace"},
+    ]);
+  } else if (state === STATE.MATCH_OVER) {
+    const w = scores[0]>scores[1]?"BLUE WINS":"GOLD WINS";
+    const c = scores[0]>scores[1]?P1_COLOR:P2_COLOR;
+    showOverlay([
+      {text:w, color:c, font:"bold 52px Consolas,monospace", gap:64},
+      {text:scores[0]+" — "+scores[1], color:"#f0f0f0", font:"26px Consolas,monospace", gap:56},
+      {text:"PRESS ENTER TO PLAY AGAIN", color:"#8890a8", font:"14px Consolas,monospace"},
+    ]);
+  }
+}
+
+function showOverlay(lines) {
+  ctx.fillStyle = "rgba(3,26,8,0.8)";
+  ctx.fillRect(0, HUD_H, WIDTH, PLAY_H);
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  let y = HUD_H + PLAY_H/2 - (lines.length-1)*24;
+  for (const ln of lines) {
+    ctx.fillStyle = ln.color||"#f0f0f0"; ctx.font = ln.font||"18px Consolas,monospace";
+    ctx.fillText(ln.text, WIDTH/2, y); y += ln.gap||46;
+  }
+}
+
+function loop(ts) { update(ts); render(); requestAnimationFrame(loop); }
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>

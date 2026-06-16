@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<!--
+  BUG HUNT — competitive bug-squashing. Bugs appear on a shared terminal
+  screen. Race your cursor to squash them before your opponent does.
+  Critical bugs (red) are worth 3 points. Watch out for FEATURE REQUEST
+  traps — squashing those costs you a point.
+
+  Player 1 (blue ■):  W / A / S / D
+  Player 2 (gold ■):  Arrow keys
+  Enter: start   ·   R: reset
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BUG HUNT</title>
+<style>
+  html, body { margin:0; height:100%; background:#000d00; color:#00ff44;
+    display:flex; align-items:center; justify-content:center;
+    font-family:Consolas,"Courier New",monospace; }
+  canvas { image-rendering:pixelated; box-shadow:0 0 40px rgba(0,255,68,0.2);
+    max-width:100vw; max-height:100vh; border-radius:6px; }
+  a.back { position:fixed; top:14px; left:16px; color:#006622; text-decoration:none;
+    font-size:.8rem; letter-spacing:.15em; }
+  a.back:hover { color:#00ff44; }
+</style>
+</head>
+<body>
+<a class="back" href="../index.html">◂ ARCADE</a>
+<canvas id="game"></canvas>
+<script>
+"use strict";
+
+const WIDTH = 800, HEIGHT = 560, HUD_H = 64;
+const PLAY_H = HEIGHT - HUD_H;
+const CURSOR_R = 14;
+const CURSOR_SPEED = 340;
+const GAME_TIME = 60;    // seconds
+const WIN_SCORE = 20;
+
+const BUG_TYPES = [
+  { emoji:"🐛", label:"BUG",      points:1,  size:22, ttl:4.0, color:"#00ff44" },
+  { emoji:"💀", label:"CRITICAL", points:3,  size:28, ttl:2.5, color:"#ff4040" },
+  { emoji:"⚡", label:"HOTFIX",   points:2,  size:20, ttl:3.0, color:"#ffff00" },
+  { emoji:"📋", label:"FEATURE?", points:-1, size:24, ttl:5.0, color:"#888888" }, // trap
+];
+
+const P1_COLOR = "#3da0ff", P2_COLOR = "#ffe81f";
+
+const canvas = document.getElementById("game");
+canvas.width = WIDTH; canvas.height = HEIGHT;
+const ctx = canvas.getContext("2d");
+
+let audioCtx = null;
+function beep(freq, dur, type) {
+  try {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.type = type||"square"; o.frequency.value = freq;
+    o.connect(g); g.connect(audioCtx.destination);
+    g.gain.setValueAtTime(0.07, audioCtx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + dur);
+    o.start(); o.stop(audioCtx.currentTime + dur);
+  } catch(e) {}
+}
+
+const STATE = { TITLE:0, PLAY:1, MATCH_OVER:2 };
+let state = STATE.TITLE, scores = [0,0];
+let cursors, bugs, gameTimer, spawnTimer;
+let popups = [];
+
+const keys = {};
+window.addEventListener("keydown", e => {
+  keys[e.key] = true;
+  if (["ArrowUp","ArrowDown","ArrowLeft","ArrowRight"].includes(e.key)) e.preventDefault();
+  if (e.key === "Enter" && state !== STATE.PLAY) resetMatch();
+  if (e.key === "r" || e.key === "R") state = STATE.TITLE;
+});
+window.addEventListener("keyup", e => { keys[e.key] = false; });
+
+function makeCursor(x, y, color, label) {
+  return { x, y, color, label, score: 0 };
+}
+
+function resetMatch() {
+  scores = [0,0];
+  cursors = [
+    makeCursor(WIDTH * 0.25, HUD_H + PLAY_H/2, P1_COLOR, "BLUE"),
+    makeCursor(WIDTH * 0.75, HUD_H + PLAY_H/2, P2_COLOR, "GOLD"),
+  ];
+  bugs = [];
+  popups = [];
+  gameTimer = GAME_TIME;
+  spawnTimer = 0;
+  state = STATE.PLAY;
+}
+
+function spawnBug() {
+  const margin = 50;
+  const type = BUG_TYPES[Math.floor(Math.random() * BUG_TYPES.length)];
+  bugs.push({
+    x: margin + Math.random() * (WIDTH - margin*2),
+    y: HUD_H + margin + Math.random() * (PLAY_H - margin*2),
+    type,
+    ttl: type.ttl,
+    maxTtl: type.ttl,
+    alive: true,
+  });
+}
+
+function addPopup(x, y, text, color) {
+  popups.push({ x, y, text, color, life:1.0 });
+}
+
+let lastTs = null;
+function update(ts) {
+  if (lastTs === null) { lastTs = ts; return; }
+  const dt = Math.min((ts-lastTs)/1000, 0.05);
+  lastTs = ts;
+  if (state !== STATE.PLAY) return;
+
+  gameTimer -= dt;
+  if (gameTimer <= 0) {
+    gameTimer = 0;
+    state = STATE.MATCH_OVER;
+    return;
+  }
+
+  // move cursors
+  if ((keys.w||keys.W) && cursors[0].y > HUD_H + CURSOR_R) cursors[0].y -= CURSOR_SPEED * dt;
+  if ((keys.s||keys.S) && cursors[0].y < HEIGHT - CURSOR_R) cursors[0].y += CURSOR_SPEED * dt;
+  if ((keys.a||keys.A) && cursors[0].x > CURSOR_R) cursors[0].x -= CURSOR_SPEED * dt;
+  if ((keys.d||keys.D) && cursors[0].x < WIDTH - CURSOR_R) cursors[0].x += CURSOR_SPEED * dt;
+  if (keys.ArrowUp    && cursors[1].y > HUD_H + CURSOR_R) cursors[1].y -= CURSOR_SPEED * dt;
+  if (keys.ArrowDown  && cursors[1].y < HEIGHT - CURSOR_R) cursors[1].y += CURSOR_SPEED * dt;
+  if (keys.ArrowLeft  && cursors[1].x > CURSOR_R) cursors[1].x -= CURSOR_SPEED * dt;
+  if (keys.ArrowRight && cursors[1].x < WIDTH - CURSOR_R) cursors[1].x += CURSOR_SPEED * dt;
+
+  // spawn bugs
+  spawnTimer -= dt;
+  if (spawnTimer <= 0) {
+    spawnBug();
+    spawnTimer = 1.2 - (GAME_TIME - gameTimer) / GAME_TIME * 0.7; // speeds up
+  }
+
+  // check bug catches
+  for (const bug of bugs) {
+    if (!bug.alive) continue;
+    bug.ttl -= dt;
+    if (bug.ttl <= 0) { bug.alive = false; continue; }
+
+    for (let i = 0; i < 2; i++) {
+      const c = cursors[i];
+      const dx = c.x - bug.x, dy = c.y - bug.y;
+      if (Math.sqrt(dx*dx + dy*dy) < CURSOR_R + bug.type.size/2) {
+        bug.alive = false;
+        scores[i] += bug.type.points;
+        if (scores[i] < 0) scores[i] = 0;
+        const pts = bug.type.points;
+        addPopup(bug.x, bug.y, (pts>=0?"+":"")+pts+" "+bug.type.label, bug.type.color);
+        beep(pts > 0 ? 660 : 180, pts > 0 ? 0.07 : 0.25, "square");
+        if (scores[0] >= WIN_SCORE || scores[1] >= WIN_SCORE) { state = STATE.MATCH_OVER; return; }
+      }
+    }
+  }
+
+  bugs = bugs.filter(b => b.alive);
+  for (const p of popups) p.life -= dt * 1.5;
+  popups = popups.filter(p => p.life > 0);
+}
+
+function render() {
+  // terminal background
+  ctx.fillStyle = "#000d00";
+  ctx.fillRect(0, 0, WIDTH, HEIGHT);
+  ctx.fillStyle = "#001500";
+  ctx.fillRect(0, HUD_H, WIDTH, PLAY_H);
+
+  // scanlines
+  ctx.fillStyle = "rgba(0,0,0,0.25)";
+  for (let y = HUD_H; y < HEIGHT; y += 4) ctx.fillRect(0, y, WIDTH, 2);
+
+  // grid (like a terminal prompt grid)
+  ctx.strokeStyle = "rgba(0,255,68,0.04)"; ctx.lineWidth = 1;
+  for (let x = 0; x < WIDTH; x += 40) {
+    ctx.beginPath(); ctx.moveTo(x, HUD_H); ctx.lineTo(x, HEIGHT); ctx.stroke();
+  }
+  for (let y = HUD_H; y < HEIGHT; y += 40) {
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(WIDTH, y); ctx.stroke();
+  }
+
+  // bugs
+  for (const bug of (bugs||[])) {
+    const alpha = bug.ttl < 1 ? bug.ttl : 1;
+    ctx.globalAlpha = alpha;
+    // urgency ring
+    const frac = 1 - bug.ttl / bug.maxTtl;
+    ctx.strokeStyle = bug.type.color; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(bug.x, bug.y, bug.type.size/2 + 8, 0, Math.PI * 2 * (1-frac));
+    ctx.stroke();
+    // emoji
+    ctx.font = bug.type.size+"px serif";
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText(bug.type.emoji, bug.x, bug.y);
+    ctx.globalAlpha = 1;
+  }
+
+  // popups
+  for (const p of (popups||[])) {
+    ctx.globalAlpha = p.life;
+    ctx.fillStyle = p.color; ctx.font = "bold 14px Consolas,monospace";
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText(p.text, p.x, p.y - (1-p.life)*30);
+    ctx.globalAlpha = 1;
+  }
+
+  // cursors
+  for (let i = 0; i < 2; i++) {
+    if (!cursors) break;
+    const c = cursors[i];
+    ctx.shadowColor = c.color; ctx.shadowBlur = 16;
+    ctx.fillStyle = c.color;
+    // crosshair
+    ctx.fillRect(c.x - CURSOR_R, c.y - 2, CURSOR_R*2, 4);
+    ctx.fillRect(c.x - 2, c.y - CURSOR_R, 4, CURSOR_R*2);
+    // center dot
+    ctx.beginPath(); ctx.arc(c.x, c.y, 4, 0, Math.PI*2); ctx.fill();
+    ctx.shadowBlur = 0;
+    // label
+    ctx.fillStyle = c.color; ctx.font = "10px Consolas,monospace";
+    ctx.textAlign = "center"; ctx.textBaseline = "top";
+    ctx.fillText(c.label, c.x, c.y + CURSOR_R + 3);
+  }
+
+  // HUD — green terminal style
+  ctx.fillStyle = "#000d00"; ctx.fillRect(0, 0, WIDTH, HUD_H);
+  ctx.fillStyle = "rgba(0,255,68,0.15)"; ctx.fillRect(0, HUD_H-2, WIDTH, 2);
+
+  ctx.textBaseline = "middle";
+  ctx.font = "bold 28px Consolas,monospace";
+  ctx.textAlign = "left"; ctx.fillStyle = P1_COLOR; ctx.fillText(scores[0], 24, HUD_H/2);
+  ctx.font = "10px Consolas,monospace"; ctx.fillText("BLUE · WASD", 60, HUD_H/2);
+  ctx.font = "bold 28px Consolas,monospace";
+  ctx.textAlign = "right"; ctx.fillStyle = P2_COLOR; ctx.fillText(scores[1], WIDTH-24, HUD_H/2);
+  ctx.font = "10px Consolas,monospace"; ctx.fillText("ARROWS · GOLD", WIDTH-60, HUD_H/2);
+  ctx.textAlign = "center"; ctx.fillStyle = "#00ff44"; ctx.font = "11px Consolas,monospace";
+  const t = Math.ceil(gameTimer||0);
+  ctx.fillText("BUG HUNT · "+t+"s", WIDTH/2, HUD_H/2 - 8);
+  ctx.fillStyle = "#006622"; ctx.font = "9px Consolas,monospace";
+  ctx.fillText("🐛=1pt  💀=3pt  ⚡=2pt  📋=-1pt", WIDTH/2, HUD_H/2 + 9);
+
+  // timer bar
+  ctx.fillStyle = gameTimer < 10 ? "#ff4040" : "#00aa33";
+  ctx.fillRect(0, HEIGHT-4, WIDTH * ((gameTimer||0)/GAME_TIME), 4);
+
+  if (state === STATE.TITLE || !cursors) {
+    showOverlay([
+      {text:"BUG HUNT", color:"#00ff44", font:"bold 62px Consolas,monospace", gap:68},
+      {text:"Squash bugs before your rival. Avoid FEATURE REQUESTS (📋).", color:"#006622", font:"13px Consolas,monospace", gap:48},
+      {text:"BLUE: WASD          GOLD: ARROW KEYS", color:"#00cc33", font:"14px Consolas,monospace", gap:50},
+      {text:"PRESS ENTER", color:P1_COLOR, font:"bold 22px Consolas,monospace"},
+    ]);
+  } else if (state === STATE.MATCH_OVER) {
+    const w = scores[0]>scores[1]?"BLUE WINS":"GOLD WINS";
+    const tied = scores[0]===scores[1];
+    const c = tied ? "#00ff44" : (scores[0]>scores[1]?P1_COLOR:P2_COLOR);
+    showOverlay([
+      {text: tied?"IT'S A TIE!":w, color:c, font:"bold 52px Consolas,monospace", gap:64},
+      {text:scores[0]+" — "+scores[1], color:"#00ff44", font:"26px Consolas,monospace", gap:56},
+      {text:"PRESS ENTER TO PLAY AGAIN", color:"#006622", font:"14px Consolas,monospace"},
+    ]);
+  }
+}
+
+function showOverlay(lines) {
+  ctx.fillStyle = "rgba(0,13,0,0.85)";
+  ctx.fillRect(0, HUD_H, WIDTH, PLAY_H);
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  let y = HUD_H + PLAY_H/2 - (lines.length-1)*24;
+  for (const ln of lines) {
+    ctx.fillStyle = ln.color||"#00ff44"; ctx.font = ln.font||"18px Consolas,monospace";
+    ctx.fillText(ln.text, WIDTH/2, y); y += ln.gap||46;
+  }
+}
+
+function loop(ts) { update(ts); render(); requestAnimationFrame(loop); }
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
