@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<!--
+  DUCT QUEST — competitive ventilation routing. Race to connect your
+  ductwork from your Air Handling Unit to the room vents. You can't
+  cross your opponent's duct runs. First to claim 3 vents wins.
+
+  Built to impress the engineers at Lindab.
+
+  Player 1 (blue):  W / A / S / D  — route duct
+  Player 2 (gold):  Arrow keys       — route duct
+  Enter: start   ·   R: reset
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DUCT QUEST</title>
+<style>
+  html, body { margin:0; height:100%; background:#d4dce8; color:#1a2a4a;
+    display:flex; align-items:center; justify-content:center;
+    font-family:Consolas,"Courier New",monospace; }
+  canvas { box-shadow:0 6px 32px rgba(0,0,0,0.22); max-width:100vw; max-height:100vh; border-radius:4px; }
+  a.back { position:fixed; top:14px; left:16px; color:#6070a0; text-decoration:none;
+    font-size:.8rem; letter-spacing:.15em; }
+  a.back:hover { color:#1e7fd4; }
+</style>
+</head>
+<body>
+<a class="back" href="../index.html">◂ ARCADE</a>
+<canvas id="game"></canvas>
+<script>
+"use strict";
+
+const CELL = 56;
+const COLS = 13, ROWS = 8;
+const HUD_H = 64;
+const WIDTH = COLS * CELL;
+const HEIGHT = ROWS * CELL + HUD_H;
+
+// direction bits
+const N=1, E=2, S=4, W=8;
+const DIRS = [
+  {dc:0,  dr:-1, bit:N, opp:S, key0:["w","W"], key1:["ArrowUp"]},
+  {dc:1,  dr: 0, bit:E, opp:W, key0:["d","D"], key1:["ArrowRight"]},
+  {dc:0,  dr: 1, bit:S, opp:N, key0:["s","S"], key1:["ArrowDown"]},
+  {dc:-1, dr: 0, bit:W, opp:E, key0:["a","A"], key1:["ArrowLeft"]},
+];
+
+// symmetric vent layout: P1 has (4,2)(4,5) close; P2 has (8,2)(8,5); (6,4) contested
+const VENT_POS = [[4,2],[8,2],[6,4],[4,5],[8,5]];
+const WIN_VENTS = 3;
+const P1_SRC = {col:0, row:3};
+const P2_SRC = {col:COLS-1, row:3};
+
+const P1_COLOR = "#1b6ec2", P1_LIGHT = "#5ab0ff";
+const P2_COLOR = "#b07d00", P2_LIGHT = "#ffe060";
+const PIPE_HALF = 9; // half-width of duct pipe in pixels
+
+const canvas = document.getElementById("game");
+canvas.width = WIDTH; canvas.height = HEIGHT;
+const ctx = canvas.getContext("2d");
+
+let audioCtx = null;
+function beep(freq, dur, type) {
+  try {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.type = type||"sine"; o.frequency.value = freq;
+    o.connect(g); g.connect(audioCtx.destination);
+    g.gain.setValueAtTime(0.06, audioCtx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + dur);
+    o.start(); o.stop(audioCtx.currentTime + dur);
+  } catch(e) {}
+}
+
+const STATE = {TITLE:0, PLAY:1, MATCH_OVER:2};
+let state = STATE.TITLE;
+let grid, players, scores, fanAngle = 0, particles = [];
+let moveCd = [0,0];
+const MOVE_DELAY = 115; // ms between moves
+
+const keys = {};
+window.addEventListener("keydown", e => {
+  if (["ArrowUp","ArrowDown","ArrowLeft","ArrowRight"].includes(e.key)) e.preventDefault();
+  keys[e.key] = true;
+  if (e.key === "Enter" && state !== STATE.PLAY) resetMatch();
+  if (e.key === "r" || e.key === "R") state = STATE.TITLE;
+});
+window.addEventListener("keyup", e => { keys[e.key] = false; });
+
+// ---------------------------------------------------------------- grid
+function initGrid() {
+  grid = Array.from({length:ROWS}, () =>
+    Array.from({length:COLS}, () => ({owner:null, conn:0, vent:false, claimedBy:null}))
+  );
+  for (const [c,r] of VENT_POS) grid[r][c].vent = true;
+  grid[P1_SRC.row][P1_SRC.col].owner = 0;
+  grid[P2_SRC.row][P2_SRC.col].owner = 1;
+}
+
+function resetMatch() {
+  scores = [0,0]; particles = [];
+  moveCd = [0,0];
+  initGrid();
+  players = [
+    {col:P1_SRC.col, row:P1_SRC.row},
+    {col:P2_SRC.col, row:P2_SRC.row},
+  ];
+  state = STATE.PLAY;
+}
+
+// ---------------------------------------------------------------- move logic
+function tryMove(pi, d) {
+  const p = players[pi];
+  const nc = p.col + d.dc, nr = p.row + d.dr;
+  if (nc<0||nc>=COLS||nr<0||nr>=ROWS) return;
+  const dest = grid[nr][nc];
+  if (dest.owner !== null && dest.owner !== pi) return; // blocked
+
+  const isNew = dest.owner !== pi;
+  if (isNew) {
+    grid[p.row][p.col].conn |= d.bit;
+    dest.conn |= d.opp;
+    dest.owner = pi;
+    beep(220 + pi*110, 0.025, "sine");
+  }
+  p.col = nc; p.row = nr;
+
+  if (isNew && dest.vent && dest.claimedBy === null) {
+    dest.claimedBy = pi;
+    scores[pi]++;
+    beep(pi===0 ? 660 : 550, 0.22, "square");
+    burst(nc, nr, pi);
+    if (scores[pi] >= WIN_VENTS) setTimeout(()=>{ state=STATE.MATCH_OVER; }, 400);
+  }
+}
+
+function burst(col, row, pi) {
+  const cx = col*CELL+CELL/2, cy = HUD_H+row*CELL+CELL/2;
+  const c = pi===0 ? P1_LIGHT : P2_LIGHT;
+  for (let i=0; i<20; i++) {
+    const a = Math.random()*Math.PI*2, spd = 40+Math.random()*120;
+    particles.push({x:cx, y:cy, vx:Math.cos(a)*spd, vy:Math.sin(a)*spd, life:1, c, r:2+Math.random()*4});
+  }
+}
+
+// ---------------------------------------------------------------- update
+let lastTs = null;
+function update(ts) {
+  if (lastTs === null) { lastTs = ts; return; }
+  const dt = Math.min((ts-lastTs)/1000, 0.05);
+  lastTs = ts;
+  fanAngle += dt * 2.8;
+  for (const p of particles) { p.x+=p.vx*dt; p.y+=p.vy*dt; p.life-=dt*1.6; }
+  particles = particles.filter(p=>p.life>0);
+  if (state !== STATE.PLAY) return;
+  moveCd[0] = Math.max(0, moveCd[0]-dt*1000);
+  moveCd[1] = Math.max(0, moveCd[1]-dt*1000);
+  for (let pi=0; pi<2; pi++) {
+    if (moveCd[pi]>0) continue;
+    const keySet = pi===0 ? "key0" : "key1";
+    for (const d of DIRS) {
+      if (d[keySet].some(k=>keys[k])) { tryMove(pi,d); moveCd[pi]=MOVE_DELAY; break; }
+    }
+  }
+}
+
+// ---------------------------------------------------------------- render helpers
+function cx(col) { return col*CELL + CELL/2; }
+function cy(row) { return HUD_H + row*CELL + CELL/2; }
+
+function drawDuct(col, row) {
+  const cell = grid[row][col];
+  if (cell.owner === null) return;
+  const x = cx(col), y = cy(row);
+  const pipeCol = cell.owner===0 ? P1_COLOR : P2_COLOR;
+  const pipeHi  = cell.owner===0 ? P1_LIGHT : P2_LIGHT;
+
+  // draw arms first (behind junction)
+  for (const d of DIRS) {
+    if (!(cell.conn & d.bit)) continue;
+    const ex = x + d.dc*CELL/2, ey = y + d.dr*CELL/2;
+    // silver casing
+    ctx.fillStyle = "#9aaabb";
+    if (d.dc!==0) ctx.fillRect(Math.min(x,ex), y-PIPE_HALF-2, Math.abs(ex-x)+1, (PIPE_HALF+2)*2);
+    else          ctx.fillRect(x-PIPE_HALF-2, Math.min(y,ey), (PIPE_HALF+2)*2, Math.abs(ey-y)+1);
+    // colored interior stripe
+    ctx.fillStyle = pipeCol;
+    if (d.dc!==0) ctx.fillRect(Math.min(x,ex), y-PIPE_HALF+2, Math.abs(ex-x)+1, (PIPE_HALF-2)*2);
+    else          ctx.fillRect(x-PIPE_HALF+2, Math.min(y,ey), (PIPE_HALF-2)*2, Math.abs(ey-y)+1);
+    // highlight stripe
+    ctx.fillStyle = pipeHi+"66";
+    if (d.dc!==0) ctx.fillRect(Math.min(x,ex), y-PIPE_HALF+2, Math.abs(ex-x)+1, 3);
+    else          ctx.fillRect(x-PIPE_HALF+2, Math.min(y,ey), 3, Math.abs(ey-y)+1);
+  }
+
+  // junction node
+  ctx.fillStyle = "#9aaabb";
+  ctx.beginPath(); ctx.arc(x, y, PIPE_HALF+2, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = pipeCol;
+  ctx.beginPath(); ctx.arc(x, y, PIPE_HALF, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = pipeHi;
+  ctx.beginPath(); ctx.arc(x, y, PIPE_HALF-4, 0, Math.PI*2); ctx.fill();
+}
+
+function drawVent(col, row) {
+  const cell = grid[row][col];
+  const x = cx(col), y = cy(row);
+  const R = CELL*0.36;
+  const claimed = cell.claimedBy !== null;
+  const pColor = claimed ? (cell.claimedBy===0?P1_COLOR:P2_COLOR) : "#5a6a7a";
+  const pLight = claimed ? (cell.claimedBy===0?P1_LIGHT:P2_LIGHT) : "#9aaabb";
+
+  // outer ring
+  ctx.fillStyle = "#c8d0dc";
+  ctx.beginPath(); ctx.arc(x, y, R+3, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = pColor;
+  ctx.beginPath(); ctx.arc(x, y, R, 0, Math.PI*2); ctx.fill();
+
+  // spinning fan blades
+  const spinSpeed = claimed ? 3.5 : 0.5;
+  const spin = fanAngle * spinSpeed * (cell.claimedBy===1?-1:1);
+  ctx.save(); ctx.translate(x, y); ctx.rotate(spin);
+  ctx.fillStyle = "rgba(255,255,255,0.75)";
+  for (let i=0; i<4; i++) {
+    ctx.save(); ctx.rotate(i*Math.PI/2);
+    ctx.beginPath();
+    ctx.ellipse(0, -R*0.42, R*0.16, R*0.32, 0.3, 0, Math.PI*2);
+    ctx.fill(); ctx.restore();
+  }
+  // center hub
+  ctx.fillStyle = "#ffffff";
+  ctx.beginPath(); ctx.arc(0, 0, 5, 0, Math.PI*2); ctx.fill();
+  ctx.restore();
+
+  // grill lines
+  ctx.strokeStyle = "rgba(255,255,255,0.4)"; ctx.lineWidth = 1;
+  for (let i=-2; i<=2; i++) {
+    const ly = y + i*(R/3);
+    const hw = Math.sqrt(Math.max(0, R*R - (i*R/3)**2));
+    ctx.beginPath(); ctx.moveTo(x-hw, ly); ctx.lineTo(x+hw, ly); ctx.stroke();
+  }
+
+  // "vent" label below
+  ctx.fillStyle = claimed ? pLight : "#6070a0";
+  ctx.textAlign = "center"; ctx.textBaseline = "top";
+  ctx.font = "8px Consolas,monospace";
+  ctx.fillText(claimed?"✔ CONNECTED":"○ VENT", x, y+R+4);
+}
+
+function drawAHU(col, row, pi) {
+  const x = cx(col), y = cy(row);
+  const pc = pi===0 ? P1_COLOR : P2_COLOR;
+  const pl = pi===0 ? P1_LIGHT : P2_LIGHT;
+  const W2 = CELL*0.88, H2 = CELL*0.68;
+
+  // casing
+  ctx.fillStyle = "#9aaabb";
+  ctx.fillRect(x-W2/2-2, y-H2/2-2, W2+4, H2+4);
+  ctx.fillStyle = "#1e2a3e";
+  ctx.fillRect(x-W2/2, y-H2/2, W2, H2);
+  ctx.strokeStyle = pc; ctx.lineWidth = 2;
+  ctx.strokeRect(x-W2/2, y-H2/2, W2, H2);
+
+  // spinning fan
+  ctx.save(); ctx.translate(x, y-4);
+  ctx.rotate(fanAngle*(pi===0?2:-2));
+  ctx.fillStyle = pl;
+  for (let i=0; i<3; i++) {
+    ctx.save(); ctx.rotate(i*Math.PI*2/3);
+    ctx.fillRect(-3, -CELL*0.25, 6, CELL*0.25);
+    ctx.restore();
+  }
+  ctx.restore();
+
+  // label
+  ctx.fillStyle = pl; ctx.font = "bold 8px Consolas,monospace";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("AHU", x, y + H2/2 - 7);
+  ctx.fillStyle = "#9aaabb"; ctx.font = "7px Consolas,monospace";
+  ctx.fillText("LINDAB", x, y + H2/2 - 0);
+}
+
+function drawCursor(col, row, pi) {
+  const x = cx(col), y = cy(row);
+  const c = pi===0 ? P1_LIGHT : P2_LIGHT;
+  ctx.strokeStyle = c; ctx.lineWidth = 3;
+  ctx.shadowColor = c; ctx.shadowBlur = 10;
+  ctx.strokeRect(x-CELL/2+4, y-CELL/2+4, CELL-8, CELL-8);
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = c+"33";
+  ctx.fillRect(x-CELL/2+4, y-CELL/2+4, CELL-8, CELL-8);
+}
+
+function render() {
+  // blueprint-style background
+  ctx.fillStyle = "#dce4f0";
+  ctx.fillRect(0, HUD_H, WIDTH, HEIGHT-HUD_H);
+
+  // blueprint grid
+  for (let r=0; r<ROWS; r++) {
+    for (let c=0; c<COLS; c++) {
+      ctx.fillStyle = (r+c)%2===0 ? "#e2eaf6" : "#d8e2ee";
+      ctx.fillRect(c*CELL, HUD_H+r*CELL, CELL, CELL);
+    }
+  }
+  ctx.strokeStyle = "#b0bcd4"; ctx.lineWidth = 0.5;
+  for (let r=0; r<=ROWS; r++) {
+    ctx.beginPath(); ctx.moveTo(0, HUD_H+r*CELL); ctx.lineTo(WIDTH, HUD_H+r*CELL); ctx.stroke();
+  }
+  for (let c=0; c<=COLS; c++) {
+    ctx.beginPath(); ctx.moveTo(c*CELL, HUD_H); ctx.lineTo(c*CELL, HEIGHT); ctx.stroke();
+  }
+
+  // Room labels (subtle)
+  ctx.fillStyle = "rgba(100,120,160,0.2)"; ctx.font = "10px Consolas,monospace";
+  ctx.textAlign = "left"; ctx.textBaseline = "top";
+  const rooms = ["CONF. A","OFFICE 1","CORRIDOR","OFFICE 2","CONF. B","SERVER RM","LOBBY","KITCHEN"];
+  for (let r=0; r<ROWS; r++) ctx.fillText(rooms[r]||"ROOM", 4, HUD_H+r*CELL+3);
+
+  // duct networks
+  if (grid) {
+    for (let r=0; r<ROWS; r++) for (let c=0; c<COLS; c++) drawDuct(c,r);
+    for (const [c,r] of VENT_POS) drawVent(c,r);
+    drawAHU(P1_SRC.col, P1_SRC.row, 0);
+    drawAHU(P2_SRC.col, P2_SRC.row, 1);
+  }
+
+  // cursors
+  if (players && state===STATE.PLAY) {
+    for (let i=0; i<2; i++) drawCursor(players[i].col, players[i].row, i);
+  }
+
+  // particles
+  for (const p of particles) {
+    ctx.globalAlpha = p.life;
+    ctx.fillStyle = p.c;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI*2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  // HUD — navy header
+  ctx.fillStyle = "#1a2a4a"; ctx.fillRect(0, 0, WIDTH, HUD_H);
+  ctx.fillStyle = "rgba(91,176,255,0.15)"; ctx.fillRect(0, HUD_H-3, WIDTH, 3);
+
+  ctx.textBaseline = "middle";
+  ctx.font = "bold 28px Consolas,monospace";
+  ctx.textAlign = "left";  ctx.fillStyle = P1_LIGHT; ctx.fillText(scores?scores[0]:0, 24, HUD_H/2);
+  ctx.font = "10px Consolas,monospace"; ctx.fillText("BLUE · WASD", 60, HUD_H/2);
+  ctx.font = "bold 28px Consolas,monospace";
+  ctx.textAlign = "right"; ctx.fillStyle = P2_LIGHT; ctx.fillText(scores?scores[1]:0, WIDTH-24, HUD_H/2);
+  ctx.font = "10px Consolas,monospace"; ctx.fillText("ARROWS · GOLD", WIDTH-60, HUD_H/2);
+  ctx.textAlign = "center"; ctx.fillStyle = "#6080b0"; ctx.font = "10px Consolas,monospace";
+  ctx.fillText("DUCT QUEST  ·  ROUTE YOUR DUCTWORK TO "+WIN_VENTS+" VENTS", WIDTH/2, HUD_H/2-8);
+  ctx.fillStyle = "#3a5080"; ctx.font = "8px Consolas,monospace";
+  ctx.fillText("VENTILATION ENGINEERING © LINDAB", WIDTH/2, HUD_H/2+9);
+
+  // overlays
+  if (state === STATE.TITLE || !grid) {
+    ctx.fillStyle = "rgba(220,228,240,0.9)";
+    ctx.fillRect(0, HUD_H, WIDTH, HEIGHT-HUD_H);
+    const lines = [
+      {text:"DUCT QUEST", color:"#1b6ec2", font:"bold 54px Consolas,monospace", gap:62},
+      {text:"Route your ventilation ductwork to connect 3 room vents.", color:"#4060a0", font:"13px Consolas,monospace", gap:44},
+      {text:"You cannot cross your opponent's duct runs.", color:"#6070a0", font:"12px Consolas,monospace", gap:44},
+      {text:"BLUE: WASD               GOLD: ARROW KEYS", color:"#1a2a4a", font:"13px Consolas,monospace", gap:50},
+      {text:"PRESS ENTER", color:"#1b6ec2", font:"bold 22px Consolas,monospace"},
+    ];
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    let ty = HUD_H + (HEIGHT-HUD_H)/2 - (lines.length-1)*22;
+    for (const ln of lines) {
+      ctx.fillStyle = ln.color; ctx.font = ln.font;
+      ctx.fillText(ln.text, WIDTH/2, ty); ty += ln.gap||44;
+    }
+    // Lindab credit
+    ctx.fillStyle = "#9aaabb"; ctx.font = "9px Consolas,monospace";
+    ctx.fillText("INSPIRED BY LINDAB VENTILATION SOLUTIONS", WIDTH/2, HEIGHT-14);
+  } else if (state === STATE.MATCH_OVER) {
+    ctx.fillStyle = "rgba(220,228,240,0.88)";
+    ctx.fillRect(0, HUD_H, WIDTH, HEIGHT-HUD_H);
+    const w = scores[0]>scores[1]?"BLUE WINS":"GOLD WINS";
+    const c2 = scores[0]>scores[1]?P1_LIGHT:P2_LIGHT;
+    const lines2 = [
+      {text:w, color:c2, font:"bold 50px Consolas,monospace", gap:62},
+      {text:"VENTS CONNECTED: "+scores[0]+" — "+scores[1], color:"#1a2a4a", font:"20px Consolas,monospace", gap:52},
+      {text:"PRESS ENTER TO PLAY AGAIN", color:"#6070a0", font:"14px Consolas,monospace"},
+    ];
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    let ty = HUD_H + (HEIGHT-HUD_H)/2 - (lines2.length-1)*22;
+    for (const ln of lines2) {
+      ctx.fillStyle = ln.color; ctx.font = ln.font;
+      ctx.fillText(ln.text, WIDTH/2, ty); ty += ln.gap||44;
+    }
+  }
+}
+
+function loop(ts) { update(ts); render(); requestAnimationFrame(loop); }
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
