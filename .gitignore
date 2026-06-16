@@ -1,0 +1,10 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# PyInstaller build artifacts
+build/
+dist/
+
+# Local Claude Code settings
+.claude/settings.local.json

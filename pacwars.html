@@ -1,0 +1,972 @@
+<!DOCTYPE html>
+<!--
+  PAC-WARS — a Star Wars themed Pac-Man (HTML/Canvas port of pacwars.py).
+
+  Fly your X-wing through the Death Star corridors, collect energy cells,
+  grab a Death Star core to power your lightsaber and hunt down the TIE fighters.
+
+  Controls: Arrow keys / WASD to move, Enter to start, Space to jump, P to pause.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PAC-WARS</title>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #050510;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: Consolas, "Courier New", monospace;
+  }
+  canvas {
+    image-rendering: pixelated;
+    box-shadow: 0 0 40px rgba(64, 140, 255, 0.25);
+    max-width: 100vw;
+    max-height: 100vh;
+  }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+"use strict";
+
+// ---------------------------------------------------------------- constants
+
+const TILE = 32;
+const HUD_H = 72;
+
+const MAZE = [
+  "###################",
+  "#........#........#",
+  "#o##.###.#.###.##o#",
+  "#.................#",
+  "#.##.#.#####.#.##.#",
+  "#....#...#...#....#",
+  "####.###.#.###.####",
+  "####.#.......#.####",
+  "####.#.##-##.#.####",
+  "    .  #GGG#  .    ",
+  "####.#.#####.#.####",
+  "####.#.......#.####",
+  "####.#.#####.#.####",
+  "#........#........#",
+  "#.##.###.#.###.##.#",
+  "#o.#.....P.....#.o#",
+  "##.#.#.#####.#.#.##",
+  "#....#...#...#....#",
+  "#.######.#.######.#",
+  "#.................#",
+  "###################",
+];
+
+const ROWS = MAZE.length;
+const COLS = MAZE[0].length;
+console.assert(MAZE.every(r => r.length === COLS), "maze rows must all be the same width");
+
+const WIDTH = COLS * TILE;
+const HEIGHT = ROWS * TILE + HUD_H;
+
+const UP = [0, -1], DOWN = [0, 1], LEFT = [-1, 0], RIGHT = [1, 0];
+const DIRS = [UP, DOWN, LEFT, RIGHT];
+
+const YELLOW = "rgb(255,232,31)";       // Star Wars logo yellow
+const SPACE = "rgb(8,8,24)";
+const WALL_FILL = "rgb(16,24,56)";
+const WALL_EDGE = "rgb(64,140,255)";
+const WHITE = "rgb(240,240,240)";
+const GREY = "rgb(150,150,160)";
+
+const GHOSTS = [
+  // name        body colour          scatter corner [col,row]
+  ["VADER",   "rgb(210,40,40)",   [COLS - 2, 1]],
+  ["BOBA",    "rgb(60,180,90)",   [1, 1]],
+  ["MAUL",    "rgb(200,70,200)",  [COLS - 2, ROWS - 2]],
+  ["TROOPER", "rgb(210,210,220)", [1, ROWS - 2]],
+];
+
+const FRIGHT_COLOR = "rgb(40,60,200)";
+const FRIGHT_FLASH = "rgb(220,220,255)";
+
+const PLAYER_SPEED = 4.4;     // tiles / second
+const JUMP_DUR = 0.55;        // seconds for a full hop
+const JUMP_HEIGHT = 20;       // peak lift in pixels
+const GHOST_SPEED = 3.9;
+const FRIGHT_SPEED = 2.6;
+const EYES_SPEED = 7.0;
+const FRIGHT_TIME = 7.0;
+const SCATTER_CHASE = [[7, 20], [7, 20], [5, 20], [5, 9999]];  // [scatter, chase] seconds
+
+// ---------------------------------------------------------------- sound (Web Audio)
+
+class SoundBank {
+  constructor() {
+    this.ok = true;
+    this.ctx = null;
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) { this.ok = false; return; }
+    try {
+      this.ctx = new AC();
+    } catch (e) {
+      this.ok = false;
+    }
+    // Imperial March opening: G G G Eb Bb G Eb Bb G
+    const g = 392.0, eb = 311.13, bb = 466.16;
+    this.march = [
+      [g, 0.30, 0.38], [g, 0.30, 0.38], [g, 0.30, 0.38], [eb, 0.22, 0.28],
+      [bb, 0.10, 0.12], [g, 0.30, 0.38], [eb, 0.22, 0.28], [bb, 0.10, 0.12],
+      [g, 0.55, 0.7],
+    ];
+  }
+
+  resume() {
+    if (this.ok && this.ctx.state === "suspended") this.ctx.resume();
+  }
+
+  // a short square/sine tone with attack+release envelope
+  tone(freq, dur, vol, shape) {
+    if (!this.ok) return;
+    const ctx = this.ctx;
+    const t0 = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = shape || "square";
+    osc.frequency.setValueAtTime(freq, t0);
+    gain.gain.setValueAtTime(0, t0);
+    gain.gain.linearRampToValueAtTime(vol, t0 + 0.004);
+    gain.gain.setValueAtTime(vol, t0 + Math.max(0.004, dur - 0.04));
+    gain.gain.linearRampToValueAtTime(0, t0 + dur);
+    osc.connect(gain).connect(ctx.destination);
+    osc.start(t0);
+    osc.stop(t0 + dur + 0.02);
+  }
+
+  // a frequency sweep f0 -> f1
+  sweep(f0, f1, dur, vol) {
+    if (!this.ok) return;
+    const ctx = this.ctx;
+    const t0 = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = "square";
+    osc.frequency.setValueAtTime(f0, t0);
+    osc.frequency.linearRampToValueAtTime(f1, t0 + dur);
+    gain.gain.setValueAtTime(vol, t0);
+    gain.gain.linearRampToValueAtTime(0, t0 + dur);
+    osc.connect(gain).connect(ctx.destination);
+    osc.start(t0);
+    osc.stop(t0 + dur + 0.02);
+  }
+
+  play(name) {
+    if (!this.ok) return;
+    this.resume();
+    switch (name) {
+      case "chomp":     this.tone(440, 0.05, 0.25); break;
+      case "chomp2":    this.tone(330, 0.05, 0.25); break;
+      case "power":     this.sweep(200, 900, 0.35, 0.4); break;
+      case "eat_ghost": this.sweep(900, 200, 0.3, 0.4); break;
+      case "death":     this.sweep(700, 60, 0.9, 0.5); break;
+      case "win":       this.sweep(300, 1200, 0.6, 0.4); break;
+      case "jump":      this.sweep(320, 880, 0.18, 0.3); break;
+    }
+  }
+
+  playMarch() {
+    if (!this.ok) return;
+    this.resume();
+    let delay = 0;
+    for (const [freq, len, gap] of this.march) {
+      const t0 = this.ctx.currentTime + delay;
+      const osc = this.ctx.createOscillator();
+      const gain = this.ctx.createGain();
+      osc.type = "square";
+      osc.frequency.setValueAtTime(freq, t0);
+      gain.gain.setValueAtTime(0, t0);
+      gain.gain.linearRampToValueAtTime(0.5, t0 + 0.004);
+      gain.gain.setValueAtTime(0.5, t0 + Math.max(0.004, len - 0.04));
+      gain.gain.linearRampToValueAtTime(0, t0 + len);
+      osc.connect(gain).connect(this.ctx.destination);
+      osc.start(t0);
+      osc.stop(t0 + len + 0.02);
+      delay += gap;
+    }
+  }
+}
+
+// ---------------------------------------------------------------- helpers
+
+function tileAt(col, row) {
+  if (row >= 0 && row < ROWS) {
+    col = ((col % COLS) + COLS) % COLS;
+    return MAZE[row][col];
+  }
+  return "#";
+}
+
+function walkable(col, row, isGhost) {
+  const t = tileAt(col, row);
+  if (t === "#") return false;
+  if (t === "-" && !isGhost) return false;
+  return true;
+}
+
+function tileCenter(col, row) {
+  return [col * TILE + TILE / 2, row * TILE + TILE / 2 + HUD_H];
+}
+
+// ms-since-start clock (replaces pygame.time.get_ticks)
+let START_TIME = performance.now();
+function getTicks() { return performance.now() - START_TIME; }
+
+// ---------------------------------------------------------------- actors
+
+class Actor {
+  constructor(col, row, speed) {
+    this.col = col; this.row = row;       // current tile
+    this.x = col; this.y = row;           // position in tile units
+    this.dir = LEFT;
+    this.speed = speed;
+    this.moving = false;
+  }
+
+  pixelPos() {
+    return [Math.floor(this.x * TILE + TILE / 2),
+            Math.floor(this.y * TILE + TILE / 2 + HUD_H)];
+  }
+
+  atCenter() {
+    return Math.abs(this.x - Math.round(this.x)) < 0.08 &&
+           Math.abs(this.y - Math.round(this.y)) < 0.08;
+  }
+
+  step(dt, isGhost) {
+    const ox = this.x, oy = this.y;
+    const [dx, dy] = this.dir;
+    let nx = this.x + dx * this.speed * dt;
+    let ny = this.y + dy * this.speed * dt;
+    // the tile we are moving into
+    const tc = Math.round(this.x) + dx, tr = Math.round(this.y) + dy;
+    if (!walkable(tc, tr, isGhost)) {
+      if (dx && (nx - Math.round(this.x)) * dx > 0) nx = Math.round(this.x);
+      if (dy && (ny - Math.round(this.y)) * dy > 0) ny = Math.round(this.y);
+    }
+    this.x = nx; this.y = ny;
+    // tunnel wrap
+    if (this.x < -0.5) this.x += COLS;
+    else if (this.x > COLS - 0.5) this.x -= COLS;
+    this.col = ((Math.round(this.x) % COLS) + COLS) % COLS;
+    this.row = Math.round(this.y);
+    // treat tunnel-wrap jumps as "still moving" rather than a teleport spike
+    const moved = Math.abs(this.x - ox) + Math.abs(this.y - oy);
+    this.moving = moved > 1e-4 && moved < 1.0;
+  }
+}
+
+class Player extends Actor {
+  constructor(col, row) {
+    super(col, row, PLAYER_SPEED);
+    this.want = LEFT;
+    this.alive = true;
+    this.jumpTimer = 0.0;
+  }
+
+  jump() {
+    if (this.alive && this.jumpTimer <= 0) {
+      this.jumpTimer = JUMP_DUR;
+      return true;
+    }
+    return false;
+  }
+
+  get jumpHeight() {
+    if (this.jumpTimer <= 0) return 0.0;
+    return Math.sin(Math.PI * (1 - this.jumpTimer / JUMP_DUR));
+  }
+
+  get airborne() {
+    return this.jumpHeight > 0.4;
+  }
+
+  update(dt) {
+    if (this.jumpTimer > 0) this.jumpTimer -= dt;
+    if (this.atCenter()) {
+      const c = Math.round(this.x), r = Math.round(this.y);
+      if (walkable(c + this.want[0], r + this.want[1])) {
+        if (this.want !== this.dir) { this.x = c; this.y = r; }
+        this.dir = this.want;
+      }
+    } else if (this.want[0] === -this.dir[0] && this.want[1] === -this.dir[1]) {
+      this.dir = this.want;  // reversing is always allowed
+    }
+    this.step(dt, false);
+  }
+}
+
+class Ghost extends Actor {
+  constructor(idx, col, row) {
+    super(col, row, GHOST_SPEED);
+    this.idx = idx;
+    this.name = GHOSTS[idx][0];
+    this.color = GHOSTS[idx][1];
+    this.corner = GHOSTS[idx][2];
+    this.home = [col, row];
+    this.state = "home";     // home, leaving, normal, frightened, eyes
+    this.homeTimer = idx * 3.0;
+    this.dir = UP;
+  }
+
+  target(game) {
+    const p = game.player;
+    if (this.state === "eyes") return game.doorTile;
+    if (game.mode === "scatter") return this.corner;
+    const pc = Math.round(p.x), pr = Math.round(p.y);
+    if (this.idx === 0) return [pc, pr];                       // Vader: direct pursuit
+    if (this.idx === 1) return [pc + p.dir[0] * 4, pr + p.dir[1] * 4];  // Boba: ambush 4 ahead
+    if (this.idx === 2) {                                      // Maul: mirror through Vader
+      const v = game.ghosts[0];
+      const ax = pc + p.dir[0] * 2, ay = pr + p.dir[1] * 2;
+      return [2 * ax - Math.round(v.x), 2 * ay - Math.round(v.y)];
+    }
+    // Trooper: chase when far, retreat when close
+    if ((pc - this.col) ** 2 + (pr - this.row) ** 2 > 64) return [pc, pr];
+    return this.corner;
+  }
+
+  chooseDir(game) {
+    const c = Math.round(this.x), r = Math.round(this.y);
+    let options = [];
+    for (const d of DIRS) {
+      if (d[0] === -this.dir[0] && d[1] === -this.dir[1]) continue;
+      const nc = c + d[0], nr = r + d[1];
+      const ghostPass = this.state === "eyes" || this.state === "leaving" || this.state === "home";
+      if (tileAt(nc, nr) === "-" && !ghostPass) continue;
+      if (walkable(nc, nr, true)) options.push(d);
+    }
+    if (options.length === 0) options = [[-this.dir[0], -this.dir[1]]];
+    if (this.state === "frightened") {
+      return options[Math.floor(Math.random() * options.length)];
+    }
+    const [tx, ty] = this.target(game);
+    let best = options[0], bestD = Infinity;
+    for (const d of options) {
+      const dist = (c + d[0] - tx) ** 2 + (r + d[1] - ty) ** 2;
+      if (dist < bestD) { bestD = dist; best = d; }
+    }
+    return best;
+  }
+
+  update(dt, game) {
+    if (this.state === "home") {
+      this.homeTimer -= dt;
+      // bob up and down inside the pen
+      this.y = this.home[1] + Math.sin(getTicks() * 0.005 + this.idx) * 0.2;
+      if (this.homeTimer <= 0) {
+        this.state = "leaving";
+        this.x = this.home[0]; this.y = this.home[1];
+      }
+      return;
+    }
+    if (this.state === "leaving") {
+      // rise straight up through the door, then start hunting
+      const [dc, dr] = game.doorTile;
+      if (Math.abs(this.x - dc) > 0.05) {
+        this.dir = dc > this.x ? RIGHT : LEFT;
+      } else {
+        this.x = dc;
+        this.dir = UP;
+        if (this.y <= dr - 1) {
+          this.y = dr - 1;
+          this.row = dr - 1;
+          this.state = game.frightTimer > 0 ? "frightened" : "normal";
+          this.dir = Math.random() < 0.5 ? LEFT : RIGHT;
+          return;
+        }
+      }
+      this.x += this.dir[0] * this.speed * dt;
+      this.y += this.dir[1] * this.speed * dt;
+      return;
+    }
+    if (this.state === "eyes") {
+      const [dc, dr] = game.doorTile;
+      if (Math.round(this.x) === dc && Math.round(this.y) === dr - 1 && this.atCenter()) {
+        // drop into the pen and respawn
+        this.state = "home";
+        this.homeTimer = 2.0;
+        this.x = this.home[0]; this.y = this.home[1];
+        this.speed = GHOST_SPEED;
+        return;
+      }
+    }
+    if (this.atCenter()) {
+      const nd = this.chooseDir(game);
+      if (nd !== this.dir) { this.x = Math.round(this.x); this.y = Math.round(this.y); }
+      this.dir = nd;
+    }
+    this.step(dt, true);
+  }
+
+  setFrightened() {
+    if (this.state === "normal") {
+      this.state = "frightened";
+      this.speed = FRIGHT_SPEED;
+      this.dir = [-this.dir[0], -this.dir[1]];
+    }
+  }
+
+  setEaten() {
+    this.state = "eyes";
+    this.speed = EYES_SPEED;
+  }
+}
+
+// ---------------------------------------------------------------- drawing
+
+let ctx;  // 2d context, set in main
+
+function fillRect(x, y, w, h, color) {
+  ctx.fillStyle = color;
+  ctx.fillRect(x, y, w, h);
+}
+
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function circle(x, y, rad, color, lineWidth) {
+  ctx.beginPath();
+  ctx.arc(x, y, Math.max(0.1, rad), 0, Math.PI * 2);
+  if (lineWidth) { ctx.lineWidth = lineWidth; ctx.strokeStyle = color; ctx.stroke(); }
+  else { ctx.fillStyle = color; ctx.fill(); }
+}
+
+function polygon(pts, color, lineWidth) {
+  ctx.beginPath();
+  ctx.moveTo(pts[0][0], pts[0][1]);
+  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+  ctx.closePath();
+  if (lineWidth) { ctx.lineWidth = lineWidth; ctx.strokeStyle = color; ctx.stroke(); }
+  else { ctx.fillStyle = color; ctx.fill(); }
+}
+
+function line(x1, y1, x2, y2, color, w) {
+  ctx.beginPath();
+  ctx.moveTo(x1, y1); ctx.lineTo(x2, y2);
+  ctx.lineWidth = w; ctx.strokeStyle = color; ctx.lineCap = "butt";
+  ctx.stroke();
+}
+
+function drawStarfield(stars, t) {
+  for (const [x, y, size, phase] of stars) {
+    const b = 90 + Math.floor(80 * (0.5 + 0.5 * Math.sin(t * 2 + phase)));
+    fillRect(x, y, size, size, `rgb(${b},${b},${Math.min(255, b + 30)})`);
+  }
+}
+
+function drawMaze() {
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      const ch = MAZE[r][c];
+      if (ch === "#") {
+        const x = c * TILE, y = r * TILE + HUD_H;
+        ctx.fillStyle = WALL_FILL;
+        roundRect(x + 2, y + 2, TILE - 4, TILE - 4, 6); ctx.fill();
+        ctx.strokeStyle = WALL_EDGE; ctx.lineWidth = 2;
+        roundRect(x + 2, y + 2, TILE - 4, TILE - 4, 6); ctx.stroke();
+      } else if (ch === "-") {
+        const x = c * TILE, y = r * TILE + HUD_H;
+        line(x + 4, y + TILE / 2, x + TILE - 4, y + TILE / 2, "rgb(180,60,60)", 3);
+      }
+    }
+  }
+}
+
+function drawPellet(col, row, t) {
+  const [x, y] = tileCenter(col, row);
+  // tiny four-point star (energy cell)
+  const s = 3 + Math.floor(1.5 * (0.5 + 0.5 * Math.sin(t * 4 + col + row)));
+  polygon([[x, y - s], [x + 2, y], [x, y + s], [x - 2, y]], YELLOW);
+  polygon([[x - s, y], [x, y - 2], [x + s, y], [x, y + 2]], WHITE);
+}
+
+function drawPower(col, row, t) {
+  // power pellet drawn as a little Death Star
+  const [x, y] = tileCenter(col, row);
+  const rr = 9 + Math.floor(2 * Math.sin(t * 5));
+  circle(x, y, rr, GREY);
+  circle(x, y, rr, "rgb(90,90,100)", 2);
+  circle(x - rr / 3, y - rr / 3, rr / 3, "rgb(90,90,100)");
+  line(x - rr, y + 2, x + rr, y + 2, "rgb(90,90,100)", 2);
+}
+
+function rotatePts(pts, ang, cx, cy) {
+  const ca = Math.cos(ang), sa = Math.sin(ang);
+  return pts.map(([px, py]) => [cx + px * ca - py * sa, cy + px * sa + py * ca]);
+}
+
+function drawPlayer(player, t, fright) {
+  const [x, y] = player.pixelPos();
+  const ang = Math.atan2(player.dir[1], player.dir[0]);
+
+  // vertical hop: a smooth arc that lifts and enlarges the ship above its shadow
+  const h = player.jumpHeight || 0.0;
+  const lift = JUMP_HEIGHT * h;
+  const scale = 1.0 + 0.45 * h;
+  const cx = x, cy = y - lift;
+
+  // ground shadow, shrinking and fading as the ship climbs
+  if (h > 0.01) {
+    const rad = Math.max(2, Math.floor(11 * (1 - 0.45 * h)));
+    ctx.save();
+    ctx.globalAlpha = (130 * (1 - h)) / 255;
+    ctx.fillStyle = "rgb(0,0,0)";
+    ctx.beginPath();
+    ctx.ellipse(x, y, rad, rad / 2, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // S-foils flap open and shut while flying, lock half-open at rest
+  const moving = player.moving || false;
+  const flap = moving ? 0.5 + 0.5 * Math.sin(t * 18) : 0.5;
+  const spread = 5 + 8 * flap;
+
+  // X-wing: fuselage + 4 wings + engines, nose pointing along +x before rotation
+  const fus = [[14, 0], [4, -3], [-10, -3], [-10, 3], [4, 3]];
+  const wingT = [[-2, -3], [-12, -3 - spread], [-9, -3 - spread], [1, -3]];
+  const wingB = [[-2, 3], [-12, 3 + spread], [-9, 3 + spread], [1, 3]];
+
+  const place = (pts) => rotatePts(pts.map(([px, py]) => [px * scale, py * scale]), ang, cx, cy);
+
+  const bodyCol = "rgb(235,235,235)";
+  polygon(place(wingT), "rgb(200,60,40)");
+  polygon(place(wingB), "rgb(200,60,40)");
+  polygon(place(fus), bodyCol);
+  const eng = place([[-11, 0]])[0];
+  circle(eng[0], eng[1], Math.max(2, Math.floor(3 * scale)), "rgb(255,140,40)");  // engine glow
+  if (fright > 0) {
+    // lightsaber glow while powered up
+    const blink = fright < 2 && Math.floor(t * 8) % 2 === 0;
+    const col = blink ? WHITE : "rgb(120,255,120)";
+    const tip = place([[26, 0]])[0];
+    const base = place([[14, 0]])[0];
+    line(base[0], base[1], tip[0], tip[1], col, 5);
+    line(base[0], base[1], tip[0], tip[1], WHITE, 2);
+  }
+}
+
+function drawGhost(ghost, t, fright) {
+  const [x, y] = ghost.pixelPos();
+  if (ghost.state === "eyes") {
+    circle(x - 5, y, 4, WHITE);
+    circle(x + 5, y, 4, WHITE);
+    circle(x - 5, y, 2, "rgb(40,40,200)");
+    circle(x + 5, y, 2, "rgb(40,40,200)");
+    return;
+  }
+  let col;
+  if (ghost.state === "frightened") {
+    col = (fright < 2 && Math.floor(t * 8) % 2 === 0) ? FRIGHT_FLASH : FRIGHT_COLOR;
+  } else {
+    col = ghost.color;
+  }
+  // TIE fighter: two hex panels + cockpit ball
+  for (const side of [-1, 1]) {
+    const px = x + side * 11;
+    const pts = [[px - 3, y - 13], [px + 3, y - 13], [px + 5, y], [px + 3, y + 13],
+                 [px - 3, y + 13], [px - 5, y]];
+    polygon(pts, "rgb(50,55,70)");
+    polygon(pts, col, 2);
+    line(x, y, px, y, col, 3);
+  }
+  circle(x, y, 9, "rgb(50,55,70)");
+  circle(x, y, 9, col, 2);
+  circle(x, y, 4, col);
+}
+
+// ---------------------------------------------------------------- game
+
+class Game {
+  constructor(sounds) {
+    this.sounds = sounds;
+    this.stars = [];
+    for (let i = 0; i < 110; i++) {
+      this.stars.push([
+        Math.floor(Math.random() * WIDTH),
+        Math.floor(Math.random() * HEIGHT),
+        [1, 1, 2][Math.floor(Math.random() * 3)],
+        Math.random() * 6.28,
+      ]);
+    }
+    this.score = 0;
+    this.high = 0;
+    this.lives = 3;
+    this.level = 1;
+    this.state = "title";   // title, ready, play, dying, levelup, gameover, paused
+    this.stateTimer = 0;
+    this.chompAlt = false;
+    this.resetLevel(true);
+  }
+
+  // -------------------------------------------------- setup
+
+  resetLevel(full) {
+    if (full) {
+      this.pellets = new Set();
+      this.powers = new Set();
+      for (let r = 0; r < ROWS; r++) {
+        for (let c = 0; c < COLS; c++) {
+          if (MAZE[r][c] === ".") this.pellets.add(c + "," + r);
+          else if (MAZE[r][c] === "o") this.powers.add(c + "," + r);
+        }
+      }
+    }
+    this.doorTile = this.findTile("-");
+    const pr = this.findTile("P");
+    this.player = new Player(pr[0], pr[1]);
+    const gh = [];
+    for (let r = 0; r < ROWS; r++)
+      for (let c = 0; c < COLS; c++)
+        if (MAZE[r][c] === "G") gh.push([c, r]);
+    this.ghosts = [];
+    for (let i = 0; i < 4; i++) {
+      const g = gh[i % gh.length];
+      this.ghosts.push(new Ghost(i, g[0], g[1]));
+    }
+    const speedMult = 1.0 + 0.08 * (this.level - 1);
+    this.player.speed = PLAYER_SPEED * speedMult;
+    for (const g of this.ghosts) g.speed = GHOST_SPEED * speedMult;
+    this.frightTimer = 0.0;
+    this.ghostCombo = 0;
+    this.mode = "scatter";
+    this.modeIdx = 0;
+    this.modeTimer = SCATTER_CHASE[0][0];
+  }
+
+  findTile(ch) {
+    for (let r = 0; r < ROWS; r++)
+      for (let c = 0; c < COLS; c++)
+        if (MAZE[r][c] === ch) return [c, r];
+    return null;
+  }
+
+  // -------------------------------------------------- update
+
+  update(dt, t) {
+    if (this.state === "title" || this.state === "gameover" || this.state === "paused") return;
+    this.stateTimer -= dt;
+    if (this.state === "ready") {
+      if (this.stateTimer <= 0) this.state = "play";
+      return;
+    }
+    if (this.state === "dying") {
+      if (this.stateTimer <= 0) {
+        if (this.lives <= 0) {
+          this.state = "gameover";
+          this.high = Math.max(this.high, this.score);
+        } else {
+          this.resetLevel(false);
+          this.state = "ready";
+          this.stateTimer = 1.5;
+        }
+      }
+      return;
+    }
+    if (this.state === "levelup") {
+      if (this.stateTimer <= 0) {
+        this.level += 1;
+        this.resetLevel(true);
+        this.state = "ready";
+        this.stateTimer = 1.5;
+      }
+      return;
+    }
+
+    // ---- play ----
+    if (this.frightTimer > 0) {
+      this.frightTimer -= dt;
+      if (this.frightTimer <= 0) {
+        this.ghostCombo = 0;
+        for (const g of this.ghosts) {
+          if (g.state === "frightened") {
+            g.state = "normal";
+            g.speed = GHOST_SPEED * (1.0 + 0.08 * (this.level - 1));
+          }
+        }
+      }
+    } else {
+      this.modeTimer -= dt;
+      if (this.modeTimer <= 0) {
+        if (this.mode === "scatter") {
+          this.mode = "chase";
+          this.modeTimer = SCATTER_CHASE[Math.min(this.modeIdx, 3)][1];
+        } else {
+          this.mode = "scatter";
+          this.modeIdx += 1;
+          this.modeTimer = SCATTER_CHASE[Math.min(this.modeIdx, 3)][0];
+        }
+        for (const g of this.ghosts) {
+          if (g.state === "normal") g.dir = [-g.dir[0], -g.dir[1]];
+        }
+      }
+    }
+
+    this.player.update(dt);
+    for (const g of this.ghosts) g.update(dt, this);
+
+    // eat pellets
+    const pc = Math.round(this.player.x), pr = Math.round(this.player.y);
+    const key = pc + "," + pr;
+    if (this.pellets.has(key)) {
+      this.pellets.delete(key);
+      this.score += 10;
+      this.chompAlt = !this.chompAlt;
+      this.sounds.play(this.chompAlt ? "chomp" : "chomp2");
+    }
+    if (this.powers.has(key)) {
+      this.powers.delete(key);
+      this.score += 50;
+      this.frightTimer = Math.max(2.5, FRIGHT_TIME - 0.5 * (this.level - 1));
+      this.ghostCombo = 0;
+      this.sounds.play("power");
+      for (const g of this.ghosts) g.setFrightened();
+    }
+
+    // collisions
+    for (const g of this.ghosts) {
+      if (g.state === "home" || g.state === "leaving" || g.state === "eyes") continue;
+      if ((g.x - this.player.x) ** 2 + (g.y - this.player.y) ** 2 < 0.45) {
+        if (g.state === "frightened") {
+          g.setEaten();
+          this.ghostCombo += 1;
+          this.score += 200 * (2 ** (this.ghostCombo - 1));
+          this.sounds.play("eat_ghost");
+        } else if (this.player.airborne) {
+          continue;  // leap clear over the TIE fighter
+        } else {
+          this.lives -= 1;
+          this.sounds.play("death");
+          this.state = "dying";
+          this.stateTimer = 1.6;
+          return;
+        }
+      }
+    }
+
+    if (this.pellets.size === 0 && this.powers.size === 0) {
+      this.sounds.play("win");
+      this.state = "levelup";
+      this.stateTimer = 2.0;
+    }
+  }
+
+  // -------------------------------------------------- draw
+
+  draw(t) {
+    fillRect(0, 0, WIDTH, HEIGHT, SPACE);
+    drawStarfield(this.stars, t);
+
+    if (this.state === "title") {
+      this.drawTitle(t);
+      return;
+    }
+
+    drawMaze();
+    for (const k of this.pellets) {
+      const [c, r] = k.split(",").map(Number);
+      drawPellet(c, r, t);
+    }
+    for (const k of this.powers) {
+      const [c, r] = k.split(",").map(Number);
+      drawPower(c, r, t);
+    }
+
+    for (const g of this.ghosts) drawGhost(g, t, this.frightTimer);
+    if (this.state === "dying") {
+      // explosion
+      const [x, y] = this.player.pixelPos();
+      const prog = 1.6 - this.stateTimer;
+      for (let i = 0; i < 10; i++) {
+        const a = i * 0.628 + prog;
+        const rr = Math.floor(prog * 30);
+        circle(Math.floor(x + Math.cos(a) * rr), Math.floor(y + Math.sin(a) * rr),
+               Math.max(1, 5 - Math.floor(prog * 3)),
+               `rgb(255,${160 + Math.floor(Math.random() * 60)},40)`);
+      }
+    } else {
+      drawPlayer(this.player, t, this.frightTimer);
+    }
+
+    // HUD
+    this.text(`SCORE  ${this.score}`, 16, 12, YELLOW, 20);
+    this.text(`HIGH  ${Math.max(this.high, this.score)}`, 16, 40, GREY, 20);
+    const lvlStr = `SECTOR ${this.level}`;
+    ctx.font = "bold 20px Consolas, monospace";
+    const lw = ctx.measureText(lvlStr).width;
+    this.text(lvlStr, WIDTH - lw - 16, 12, WALL_EDGE, 20);
+    for (let i = 0; i < this.lives - 1; i++) {
+      const fake = new Player(0, 0);
+      fake.x = (WIDTH - 30 - i * 34) / TILE - 0.5;
+      fake.y = (44 - HUD_H) / TILE - 0.5;
+      fake.dir = RIGHT;
+      drawPlayer(fake, 0, 0);
+    }
+
+    if (this.state === "ready") this.centerText("MAY THE FORCE BE WITH YOU", YELLOW);
+    else if (this.state === "paused") this.centerText("PAUSED", WHITE);
+    else if (this.state === "gameover") {
+      this.centerText("THE FORCE IS NOT WITH YOU", "rgb(255,80,80)");
+      ctx.font = "bold 20px Consolas, monospace";
+      const msg = "PRESS ENTER TO TRY AGAIN";
+      const w = ctx.measureText(msg).width;
+      this.text(msg, WIDTH / 2 - w / 2, HEIGHT / 2 + 30, WHITE, 20);
+    } else if (this.state === "levelup") this.centerText("SECTOR CLEARED!", "rgb(120,255,120)");
+  }
+
+  // text helper: y is the top of the text (pygame style)
+  text(str, x, y, color, size, bold) {
+    ctx.font = `${bold === false ? "" : "bold "}${size}px Consolas, "Courier New", monospace`;
+    ctx.textBaseline = "top";
+    ctx.fillStyle = color;
+    ctx.fillText(str, x, y);
+  }
+
+  centerText(str, color) {
+    ctx.font = "bold 32px Consolas, monospace";
+    const w = ctx.measureText(str).width;
+    const h = 32;
+    const x = WIDTH / 2 - w / 2;
+    const y = HEIGHT / 2 - 10;
+    ctx.save();
+    ctx.globalAlpha = 210 / 255;
+    fillRect(x - 12, y - 6, w + 24, h + 12, SPACE);
+    ctx.restore();
+    this.text(str, x, y, color, 32);
+  }
+
+  drawTitle(t) {
+    this.centerHeader("P A C - W A R S", 110, YELLOW, 32);
+    this.centerHeader("A PAC-MAN STORY FROM A GALAXY FAR, FAR AWAY", 170, GREY, 20);
+
+    const lines = [
+      ["Pilot your X-WING through the Death Star.", WHITE],
+      ["Collect every energy cell.", WHITE],
+      ["Grab a DEATH STAR CORE to ignite your", WHITE],
+      ["lightsaber and strike down TIE fighters!", WHITE],
+      ["", WHITE],
+      ["VADER hunts you.  BOBA cuts you off.", "rgb(210,40,40)"],
+      ["MAUL flanks you.  TROOPER panics.", "rgb(200,70,200)"],
+    ];
+    let y = 250;
+    for (const [txt, col] of lines) {
+      if (txt) this.centerHeader(txt, y, col, 20);
+      y += 34;
+    }
+
+    // demo ships
+    const fake = new Player(0, 0);
+    fake.x = 4.0; fake.y = (520 - HUD_H) / TILE - 0.5;
+    fake.dir = RIGHT;
+    drawPlayer(fake, t, (Math.floor(t) % 4 < 2) ? 1 : 0);
+    for (let i = 0; i < 4; i++) {
+      const g = new Ghost(i, 0, 0);
+      g.x = 8.0 + i * 2.2;
+      g.y = (520 - HUD_H) / TILE - 0.5;
+      g.state = "normal";
+      drawGhost(g, t, 0);
+    }
+
+    if (Math.floor(t * 2) % 2 === 0) this.centerHeader("PRESS ENTER", 580, WHITE, 32);
+    this.centerHeader("ARROWS / WASD TO MOVE   P = PAUSE   ESC = QUIT", 640, GREY, 20);
+  }
+
+  centerHeader(str, y, color, size) {
+    ctx.font = `bold ${size}px Consolas, monospace`;
+    const w = ctx.measureText(str).width;
+    this.text(str, WIDTH / 2 - w / 2, y, color, size);
+  }
+
+  // -------------------------------------------------- input
+
+  key(k) {
+    if (k === "ArrowUp" || k === "w" || k === "W") this.player.want = UP;
+    else if (k === "ArrowDown" || k === "s" || k === "S") this.player.want = DOWN;
+    else if (k === "ArrowLeft" || k === "a" || k === "A") this.player.want = LEFT;
+    else if (k === "ArrowRight" || k === "d" || k === "D") this.player.want = RIGHT;
+    else if ((k === "p" || k === "P") && (this.state === "play" || this.state === "paused"))
+      this.state = this.state === "play" ? "paused" : "play";
+    else if (k === " " && this.state === "play") {
+      if (this.player.jump()) this.sounds.play("jump");
+    } else if (k === "Enter" || k === " ") {
+      if (this.state === "title") this.startGame();
+      else if (this.state === "gameover") {
+        this.score = 0;
+        this.lives = 3;
+        this.level = 1;
+        this.resetLevel(true);
+        this.startGame();
+      }
+    }
+  }
+
+  startGame() {
+    this.state = "ready";
+    this.stateTimer = 2.0 + (this.sounds.ok ? 3.2 : 0);
+    if (this.sounds.ok) this.sounds.playMarch();
+  }
+}
+
+// ---------------------------------------------------------------- main
+
+function main() {
+  const canvas = document.getElementById("game");
+  canvas.width = WIDTH;
+  canvas.height = HEIGHT;
+  ctx = canvas.getContext("2d");
+
+  const sounds = new SoundBank();
+  const game = new Game(sounds);
+
+  // unlock audio on first interaction (browser autoplay policy)
+  const unlock = () => { sounds.resume(); };
+  window.addEventListener("keydown", unlock, { once: true });
+  window.addEventListener("pointerdown", unlock, { once: true });
+
+  window.addEventListener("keydown", (ev) => {
+    // prevent the page from scrolling on arrows / space
+    if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", " "].includes(ev.key)) {
+      ev.preventDefault();
+    }
+    if (ev.key === "Escape") return;  // no-op in browser (can't close the tab)
+    if (ev.repeat) return;
+    game.key(ev.key);
+  });
+
+  let t = 0.0;
+  let last = performance.now();
+  function frame(now) {
+    let dt = (now - last) / 1000.0;
+    last = now;
+    dt = Math.min(dt, 0.05);
+    t += dt;
+    game.update(dt, t);
+    game.draw(t);
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+}
+
+main();
+</script>
+</body>
+</html>
